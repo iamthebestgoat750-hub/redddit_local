@@ -1,0 +1,216 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  password      String?   // For email/password auth
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  projects      Project[]
+  subscription  Subscription?
+}
+
+model Account {
+  id                 String  @id @default(cuid())
+  userId             String
+  type               String
+  provider           String
+  providerAccountId  String
+  refresh_token      String?
+  access_token       String?
+  expires_at         Int?
+  token_type         String?
+  scope              String?
+  id_token           String?
+  session_state      String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// App Specific Models
+
+model Project {
+  id          String   @id @default(cuid())
+  name        String
+  websiteUrl  String?
+  websiteDescription String?
+  description String?
+  replyTone   String?  @default("Friendly")
+  mentionType String?  @default("URL") // URL, Brand, Both
+  targetSubreddits String? // JSON string array
+  userId      String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaigns   Campaign[]
+  redditAccounts RedditAccount[]
+  leads       Lead[]
+}
+
+model RedditAccount {
+  id          String   @id @default(cuid())
+  username    String
+  password    String   // Encrypted
+  clientId    String?
+  clientSecret String?
+  proxy       String?
+  status      String   @default("active") // active, banned, warmup, cooldown
+  karma       Int      @default(0)
+  accountAge  Int?     // Days
+  browserCookies String? // JSON: stored cookies for session persistence across restarts
+  projectId   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  warmupLogs  WarmupLog[]
+  posts       Post[]
+  comments    Comment[]
+}
+
+model Campaign {
+  id          String   @id @default(cuid())
+  name        String
+  status      String   @default("draft") // draft, active, paused, completed
+  projectId   String
+  schedule    String?  // Cron expression or JSON schedule
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  posts       Post[]
+}
+
+model Post {
+  id              String   @id @default(cuid())
+  title           String
+  content         String
+  subreddit       String
+  status          String   @default("pending") // pending, posted, failed
+  redditUrl       String?
+  redditId        String?
+  scheduledFor    DateTime?
+  postedAt        DateTime?
+  campaignId      String?
+  redditAccountId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  campaign        Campaign?      @relation(fields: [campaignId], references: [id])
+  redditAccount   RedditAccount? @relation(fields: [redditAccountId], references: [id])
+  comments        Comment[]
+  analytics       Analytics?
+}
+
+model Comment {
+  id              String   @id @default(cuid())
+  content         String
+  redditUrl       String?
+  redditId        String?
+  parentId        String?  // Reddit ID of parent post/comment
+  status          String   @default("posted")
+  postId          String?
+  redditAccountId String
+  postedAt        DateTime @default(now())
+
+  post            Post?          @relation(fields: [postId], references: [id])
+  redditAccount   RedditAccount  @relation(fields: [redditAccountId], references: [id])
+}
+
+model Lead {
+  id              String   @id @default(cuid())
+  redditId        String   @unique
+  title           String
+  content         String   @default("")
+  author          String   @default("")
+  subreddit       String
+  url             String
+  relevanceScore  Int      @default(0)
+  status          String   @default("new") // new, interested, ignored, replied
+  aiAnalysis      String?  
+  projectId       String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  project         Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model Subreddit {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  subscribers Int?
+  activeUsers Int?
+  category    String?
+  isFriendly  Boolean  @default(true) // AI score
+  rules       String?
+  lastScraped DateTime?
+}
+
+model WarmupLog {
+  id              String   @id @default(cuid())
+  redditAccountId String
+  action          String   // upvote, browse, comment
+  targetSubreddit String?
+  targetPostId    String?
+  performedAt     DateTime @default(now())
+
+  redditAccount   RedditAccount @relation(fields: [redditAccountId], references: [id], onDelete: Cascade)
+}
+
+model Analytics {
+  id          String   @id @default(cuid())
+  postId      String   @unique
+  upvotes     Int      @default(0)
+  comments    Int      @default(0)
+  views       Int      @default(0)
+  updatedAt   DateTime @updatedAt
+
+  post        Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+}
+
+model Subscription {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  plan            String   @default("free") // free, pro, agency
+  status          String   @default("active")
+  startDate       DateTime @default(now())
+  endDate         DateTime?
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}

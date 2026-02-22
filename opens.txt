@@ -1,0 +1,81 @@
+﻿268: <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+269: <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
+270: <div className="flex-1">
+272: <div className="flex items-center gap-3">
+275: <div className="flex items-center gap-2 bg-secondary/40 border border-border px-3 py-1.5 rounded-xl ml-4">
+288: <div className="flex items-center gap-4 bg-secondary/30 border border-border/50 px-4 py-2 rounded-2xl ml-4">
+289: <div className="flex flex-col">
+297: <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all duration-300 ${debugMode ? 'left-5.5' : 'left-0.5'}`} />
+307: <div className="text-sm">
+313: <div className="flex items-center gap-3">
+332: <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+334: <div className="lg:col-span-12 xl:col-span-7 space-y-6">
+338: <div className="flex items-center gap-2 mb-4 overflow-x-auto pb-2 scrollbar-none">
+340: <div key={i} className="flex items-center">
+341: <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold transition-all ${step === i ? 'bg-primary text-white shadow-lg shadow-primary/20' :
+347: {i < 4 && <div className={`w-8 h-0.5 mx-2 ${step > i ? 'bg-green-500/20' : 'bg-secondary'}`} />}
+353: <div className="glass-panel p-8 rounded-3xl border border-border min-h-[500px] flex flex-col justify-center relative overflow-hidden">
+355: <div className="absolute -top-24 -left-24 w-64 h-64 bg-primary/5 rounded-full blur-[80px] pointer-events-none" />
+359: <div className="animate-in fade-in slide-in-from-right-4 duration-500 text-center max-w-md mx-auto w-full">
+360: <div className="w-16 h-16 bg-primary/10 rounded-2xl flex items-center justify-center text-2xl mx-auto mb-6">
+366: <div className="space-y-4">
+387: <div className="animate-in fade-in slide-in-from-right-4 duration-500 w-full">
+388: <div className="flex items-center gap-4 mb-8">
+389: <div className="p-3 bg-yellow-500/10 rounded-2xl">
+392: <div>
+398: <div className="grid grid-cols-2 gap-3 mb-8">
+412: <div className="flex gap-4">
+427: <div className="animate-in fade-in slide-in-from-right-4 duration-500 w-full">
+428: <div className="flex items-center gap-4 mb-8">
+429: <div className="p-3 bg-blue-500/10 rounded-2xl">
+432: <div>
+438: <div className="grid grid-cols-2 gap-3 mb-6 max-h-[250px] overflow-y-auto pr-2 custom-scrollbar">
+452: <div className="flex gap-2 mb-8">
+464: <div className="flex gap-4">
+478: <div className="animate-in fade-in slide-in-from-right-4 duration-500 w-full">
+479: <div className="flex items-center gap-4 mb-8">
+480: <div className="p-3 bg-purple-500/10 rounded-2xl">
+483: <div>
+489: <div className="grid grid-cols-2 gap-3 mb-8">
+502: <div className="flex gap-4">
+511: <div className="animate-in fade-in slide-in-from-right-4 duration-500 w-full">
+512: <div className="flex items-center gap-4 mb-6">
+513: <div className="p-3 bg-primary/10 rounded-2xl">
+516: <div>
+529: <div className="flex gap-4">
+544: <div className="animate-in fade-in duration-700 w-full">
+547: <div className="animate-in fade-in slide-in-from-bottom-4 duration-500 w-full space-y-6">
+548: <div className="flex items-center justify-between mb-4">
+553: <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+555: <div className="space-y-4">
+556: <div>
+566: <div>
+568: <div className="grid grid-cols-2 gap-2 max-h-[150px] overflow-y-auto pr-2 custom-scrollbar border border-border/50 rounded-xl p-3 bg-secondary/20">
+580: <div className="flex gap-2 mt-2">
+592: <div className="grid grid-cols-2 gap-3">
+593: <div>
+605: <div>
+621: <div className="space-y-4">
+622: <div>
+624: <div className="flex flex-wrap gap-2 border border-border/50 rounded-xl p-3 bg-secondary/20 max-h-[120px] overflow-y-auto">
+638: <div>
+650: <div className="flex gap-4 pt-4">
+668: <div className="text-center">
+669: <div className="w-20 h-20 bg-green-500/10 rounded-full flex items-center justify-center mx-auto mb-6">
+670: <div className="w-10 h-10 bg-green-500 rounded-full animate-pulse shadow-lg shadow-green-500/50" />
+675: <div className="bg-secondary/50 rounded-2xl p-6 border border-border inline-block text-left w-full max-w-sm">
+677: <div className="space-y-2">
+678: <div className="flex justify-between text-sm">
+682: <div className="flex justify-between text-sm">
+686: <div className="flex justify-between text-sm">
+700: <div className="lg:col-span-12 xl:col-span-5">
+701: <div className="glass-panel p-6 rounded-2xl border border-border h-full flex flex-col">
+702: <div className="flex items-center justify-between mb-6">
+707: <div className="space-y-4 flex-1 overflow-y-auto max-h-[700px] pr-2 custom-scrollbar">
+709: <div className="py-20 text-center">
+714: <div className="py-20 text-center px-6">
+715: <div className="w-16 h-16 rounded-full bg-primary/5 flex items-center justify-center mx-auto mb-4 border border-primary/10">
+723: <div key={lead.id} className="p-4 rounded-xl bg-secondary/20 border border-border group transition-all hover:border-primary/20">
+724: <div className="flex items-center justify-between mb-2">
+731: <div className="mt-3 bg-secondary/30 rounded-lg p-2.5 border border-border">
+736: <div className="flex items-center gap-2 mt-4">
