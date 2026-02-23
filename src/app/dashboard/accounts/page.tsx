@@ -91,9 +91,7 @@ export default function AccountsPage() {
             fetchAccounts();
         } catch (error: any) {
             toast.error(error.message);
-            // Close live view if connection failed and modal was opened
-            setLiveAccount(null);
-            setIsPolling(false);
+            // NOTE: Keep Live View modal open so user can see the last screenshot!
         } finally {
             if (pollInterval) clearInterval(pollInterval);
             setIsActionLoading(false);
@@ -298,7 +296,7 @@ export default function AccountsPage() {
                                         <td className="p-4 text-foreground/80">{acc.accountAge}</td>
                                         <td className="p-4 text-right">
                                             <div className="flex items-center justify-end gap-2">
-                                                {(acc.status === 'warming' || acc.status === 'warmup' || acc.status === 'connecting') && (
+                                                {(acc.status === 'warming' || acc.status === 'warmup' || acc.status === 'connecting' || acc.status === 'failed') && (
                                                     <button
                                                         onClick={() => handleViewLive(acc)}
                                                         className="px-3 py-1.5 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 transition-all text-xs font-bold uppercase"
