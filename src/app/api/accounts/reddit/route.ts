@@ -100,9 +100,9 @@ export async function POST(req: Request) {
 
         accountId = tempAccount.id;
 
-        // --- REAL VERIFICATION (Playwright) ---
-        console.log(`Verifying credentials for ${cleanInput}...`);
-        const headless = !debugMode;
+        // On Railway/production: ALWAYS headless (no XServer). Only locally can we open a visible browser.
+        const isProduction = process.env.NODE_ENV === 'production';
+        const headless = isProduction ? true : !debugMode;
         const verification = await verifyRedditCredentials(cleanInput, password, headless, accountId);
 
         if (!verification.success) {

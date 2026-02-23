@@ -17,8 +17,12 @@ export async function POST(
     const body = await req.json().catch(() => ({}));
     const debugMode = body.debugMode || false;
 
+    // On Railway/production: ALWAYS headless (no XServer). Only locally can we open a visible browser.
+    const isProduction = process.env.NODE_ENV === 'production';
+    const headless = isProduction ? true : !debugMode;
+
     try {
-        const result = await warmupAccount(id, !debugMode);
+        const result = await warmupAccount(id, headless);
 
         if (result.success) {
             return NextResponse.json({
