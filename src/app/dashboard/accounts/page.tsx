@@ -51,6 +51,25 @@ export default function AccountsPage() {
     const handleAdd = async (e: React.FormEvent) => {
         e.preventDefault();
         setIsActionLoading(true);
+
+        // Poll accounts every 2s while verifying to auto-open Live View
+        let pollInterval: NodeJS.Timeout | null = null;
+        let liveOpened = false;
+        pollInterval = setInterval(async () => {
+            try {
+                const res = await fetch("/api/accounts/reddit");
+                if (res.ok) {
+                    const data: RedditAccount[] = await res.json();
+                    setAccounts(data);
+                    const connecting = data.find(a => a.status === 'connecting');
+                    if (connecting && !liveOpened) {
+                        liveOpened = true;
+                        handleViewLive(connecting);
+                    }
+                }
+            } catch (e) { }
+        }, 2000);
+
         try {
             const res = await fetch("/api/accounts/reddit", {
                 method: "POST",
@@ -58,22 +77,27 @@ export default function AccountsPage() {
                 body: JSON.stringify({
                     username: newUsername,
                     password: newPassword,
-                    debugMode: false
+                    debugMode: debugMode
                 }),
             });
 
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || "Failed to add account");
 
-            toast.success("Account connected successfully");
+            toast.success("Account connected successfully! ✅");
             setIsAdding(false);
             setNewUsername("");
             setNewPassword("");
             fetchAccounts();
         } catch (error: any) {
             toast.error(error.message);
+            // Close live view if connection failed and modal was opened
+            setLiveAccount(null);
+            setIsPolling(false);
         } finally {
+            if (pollInterval) clearInterval(pollInterval);
             setIsActionLoading(false);
+            fetchAccounts();
         }
     };
 

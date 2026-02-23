@@ -107,8 +107,11 @@ export async function POST(req: Request) {
 
         if (!verification.success) {
             console.warn(`Verification failed for ${cleanInput}: ${verification.error}`);
-            // Delete the temp account since verification failed
-            await prisma.redditAccount.delete({ where: { id: accountId } });
+            // Keep account with 'failed' status so user can review screenshots
+            await prisma.redditAccount.update({
+                where: { id: accountId },
+                data: { status: "failed" }
+            });
             return NextResponse.json({
                 error: verification.error || "Login failed. Please check your credentials."
             }, { status: 400 });
