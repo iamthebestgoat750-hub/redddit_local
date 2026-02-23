@@ -20,9 +20,9 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
 
         // Update live logs in DB for dashboard visibility
         try {
-            await prisma.redditAccount.update({
+            await (prisma as any).redditAccount.update({
                 where: { id: accountId },
-                data: { lastDebugLogs: JSON.stringify(logs.slice(-50)) } // Keep last 50 logs
+                data: { lastDebugLogs: JSON.stringify(logs.slice(-50)) }
             });
         } catch (e) { }
     };
@@ -31,7 +31,7 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
         try {
             const screenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
             const base64 = `data:image/jpeg;base64,${screenshot.toString('base64')}`;
-            await prisma.redditAccount.update({
+            await (prisma as any).redditAccount.update({
                 where: { id: accountId },
                 data: { lastDebugScreenshot: base64 }
             });
@@ -169,32 +169,58 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
         }
 
         if (!isLoggedIn) {
-            await addLog("No valid session found. Navigating to login...");
-            await page.goto("https://www.reddit.com/login", { waitUntil: 'domcontentloaded' });
+            await addLog("No valid session. Going to reddit.com to click Log In...");
+
+            // Step 1: Go to reddit.com homepage
+            await page.goto("https://www.reddit.com/", { waitUntil: 'domcontentloaded', timeout: 30000 });
             await captureScreenshot(page);
+            await addLog("📸 Step 1: Opened reddit.com homepage");
+
+            // Step 2: Click the Log In button on the navbar
+            try {
+                const loginBtn = await page.waitForSelector(
+                    'a[href*="/login"], a:has-text("Log In"), button:has-text("Log In"), #login-link',
+                    { timeout: 10000 }
+                );
+                await loginBtn!.click();
+                await addLog("📸 Step 2: Clicked Log In button on homepage");
+                // Wait for login page to fully load
+                await page.waitForURL(/login/, { timeout: 15000 }).catch(() => { });
+            } catch {
+                // Fallback: go directly to /login if button not found
+                await addLog("Login button not found, navigating directly to /login...");
+                await page.goto("https://www.reddit.com/login", { waitUntil: 'domcontentloaded', timeout: 30000 });
+            }
+
+            await captureScreenshot(page);
+            await addLog("📸 Step 3: Login page loaded - filling credentials");
 
             const userSelector = 'input[name="username"], #login-username, [name="username"]';
             const passSelector = 'input[name="password"], #login-password, [name="password"]';
 
             await page.waitForSelector(userSelector, { timeout: 15000 });
 
-            // Use click + type instead of fill to handle custom faceplate-text-input elements
             await page.click(userSelector);
             await page.keyboard.type(account.username, { delay: 100 });
 
             await page.click(passSelector);
             await page.keyboard.type(password, { delay: 100 });
 
+            await captureScreenshot(page);
+            await addLog("📸 Step 4: Credentials filled - clicking submit");
+
             await page.click('button[type="submit"], button:has-text("Log In")');
 
             // Wait for landing on home
             await page.waitForURL((url) => url.toString().includes("reddit.com") && !url.toString().includes("login"), { timeout: 90000 });
+            await captureScreenshot(page);
+            await addLog("📸 Step 5: Login successful! Now on reddit.com");
 
             // Wait a few seconds to ensure cookies are ready
-            addLog("Login successful. Saving session to DB...");
+            await addLog("Saving session to DB...");
             await page.waitForTimeout(3000);
 
-            // ✅ Save cookies to database (survives Render redeploys)
+            // ✅ Save cookies to database
             await saveCookiesToDb(accountId, context!);
 
             // Final Verification
@@ -203,9 +229,9 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
             if (!verified) {
                 throw new Error("Login verification failed. Account might be locked or credentials incorrect.");
             }
-            await addLog("Login successful and verified.");
+            await addLog("✅ Login verified and session saved successfully!");
         } else {
-            await addLog("Active session detected and verified.");
+            await addLog("✅ Active session detected - no login needed.");
         }
 
         await checkStop();

@@ -5,7 +5,7 @@ import { NextResponse } from "next/server";
 
 export async function GET(
     req: Request,
-    { params }: { params: { id: string } }
+    { params }: { params: Promise<{ id: string }> }
 ) {
     const session = await getServerSession(authOptions);
 
@@ -14,9 +14,11 @@ export async function GET(
     }
 
     try {
-        const account = await prisma.redditAccount.findUnique({
+        const { id } = await params;
+
+        const account = await (prisma as any).redditAccount.findFirst({
             where: {
-                id: params.id,
+                id: id,
                 project: { userId: (session.user as any).id }
             },
             select: {
@@ -30,7 +32,7 @@ export async function GET(
         }
 
         return NextResponse.json({
-            screenshot: account.lastDebugScreenshot,
+            screenshot: account.lastDebugScreenshot ?? null,
             logs: account.lastDebugLogs ? JSON.parse(account.lastDebugLogs) : [],
         });
     } catch (error) {

@@ -170,7 +170,7 @@ export default function AccountsPage() {
                     >
                         <div className="glass-panel p-6 rounded-2xl border-primary/30">
                             <h3 className="text-lg font-bold text-foreground mb-4">Connect New Account</h3>
-                            <div className="flex flex-col md:flex-row gap-4">
+                            <form onSubmit={handleAdd} className="flex flex-col md:flex-row gap-4">
                                 <input
                                     type="text"
                                     required
@@ -215,7 +215,7 @@ export default function AccountsPage() {
                                         {isActionLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : "Connect"}
                                     </button>
                                 </div>
-                            </div>
+                            </form>
                             <div className="mt-4 flex items-center gap-2 text-sm text-yellow-600 bg-yellow-500/10 p-3 rounded-lg border border-yellow-500/20">
                                 <ShieldAlert className="w-4 h-4" />
                                 <p>We use end-to-end encryption. Your credentials are never stored in plain text.</p>
