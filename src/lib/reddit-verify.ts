@@ -39,6 +39,7 @@ async function saveLogToDb(accountId: string, msg: string) {
         });
     } catch (e) { }
 }
+
 export async function verifyRedditCredentials(username: string, password: string, headless: boolean = true, accountId?: string): Promise<VerificationResult> {
     let context: BrowserContext | undefined;
     let step = "init";
@@ -221,16 +222,24 @@ export async function verifyRedditCredentials(username: string, password: string
                 };
             }
 
-            if (result === "timeout") {
-                return {
-                    success: false,
-                    error: "❌ Login timed out (30s). Reddit may be showing a CAPTCHA or is slow. Check Railway logs for [DEBUG] messages."
-                };
-            }
-
             if (result === "error") {
                 const errorText = await page.locator('[role="alert"], .AnimatedForm__errorMessage').first().innerText().catch(() => "Invalid username or password");
+                if (accountId) {
+                    await saveScreenshotToDb(accountId, page);
+                    await saveLogToDb(accountId, `❌ Error on page: ${errorText}`);
+                }
                 return { success: false, error: errorText };
+            }
+
+            if (result === "timeout") {
+                if (accountId) {
+                    await saveScreenshotToDb(accountId, page);
+                    await saveLogToDb(accountId, "❌ Timeout (30s) - no success or error page detected.");
+                }
+                return {
+                    success: false,
+                    error: "❌ Login timed out (30s). Reddit may be showing a CAPTCHA or is slow."
+                };
             }
 
             // result === "success"

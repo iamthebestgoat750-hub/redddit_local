@@ -359,13 +359,30 @@ export default function AccountsPage() {
                             <div className="flex-1 overflow-auto p-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
                                 {/* Screenshot Section */}
                                 <div className="space-y-4">
-                                    <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">Live Screenshot</h3>
-                                    <div className="aspect-video bg-black rounded-xl border border-border overflow-hidden relative group">
+                                    <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider flex items-center justify-between">
+                                        Live Screenshot
+                                        {liveScreenshot && (
+                                            <button
+                                                onClick={() => {
+                                                    const win = window.open();
+                                                    win?.document.write(`<img src="${liveScreenshot}" style="width:100%">`);
+                                                }}
+                                                className="text-[10px] text-primary hover:underline"
+                                            >
+                                                View Full Size
+                                            </button>
+                                        )}
+                                    </h3>
+                                    <div className="aspect-video bg-black rounded-xl border border-border overflow-hidden relative group cursor-zoom-in">
                                         {liveScreenshot ? (
                                             <img
                                                 src={liveScreenshot}
                                                 alt="Bot Screenshot"
                                                 className="w-full h-full object-contain"
+                                                onClick={() => {
+                                                    const win = window.open();
+                                                    win?.document.write(`<img src="${liveScreenshot}" style="width:100%">`);
+                                                }}
                                             />
                                         ) : (
                                             <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-muted-foreground">
