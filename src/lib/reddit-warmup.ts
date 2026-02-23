@@ -12,10 +12,30 @@ export interface WarmupResult {
 
 export async function warmupAccount(accountId: string, headless: boolean = true): Promise<WarmupResult> {
     const logs: string[] = [];
-    const addLog = (msg: string) => {
+    const addLog = async (msg: string) => {
         const timestamp = new Date().toLocaleTimeString();
+        const fullMsg = `${timestamp}: ${msg}`;
         console.log(`[WARMUP][${timestamp}] ${msg}`);
-        logs.push(`${timestamp}: ${msg}`);
+        logs.push(fullMsg);
+
+        // Update live logs in DB for dashboard visibility
+        try {
+            await prisma.redditAccount.update({
+                where: { id: accountId },
+                data: { lastDebugLogs: JSON.stringify(logs.slice(-50)) } // Keep last 50 logs
+            });
+        } catch (e) { }
+    };
+
+    const captureScreenshot = async (page: Page) => {
+        try {
+            const screenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
+            const base64 = `data:image/jpeg;base64,${screenshot.toString('base64')}`;
+            await prisma.redditAccount.update({
+                where: { id: accountId },
+                data: { lastDebugScreenshot: base64 }
+            });
+        } catch (e) { }
     };
 
     let context: BrowserContext | undefined;
@@ -45,7 +65,7 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
         });
 
         const password = decrypt(account.password);
-        addLog(`Starting warmup for @${account.username}...`);
+        await addLog(`Starting warmup for @${account.username}...`);
 
         context = await chromium.launchPersistentContext(sessionPath, {
             headless: headless,
@@ -149,8 +169,9 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
         }
 
         if (!isLoggedIn) {
-            addLog("No valid session found. Navigating to login...");
+            await addLog("No valid session found. Navigating to login...");
             await page.goto("https://www.reddit.com/login", { waitUntil: 'domcontentloaded' });
+            await captureScreenshot(page);
 
             const userSelector = 'input[name="username"], #login-username, [name="username"]';
             const passSelector = 'input[name="password"], #login-password, [name="password"]';
@@ -178,12 +199,13 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
 
             // Final Verification
             const verified = await verifySession(account.username);
+            await captureScreenshot(page);
             if (!verified) {
                 throw new Error("Login verification failed. Account might be locked or credentials incorrect.");
             }
-            addLog("Login successful and verified.");
+            await addLog("Login successful and verified.");
         } else {
-            addLog("Active session detected and verified.");
+            await addLog("Active session detected and verified.");
         }
 
         await checkStop();
@@ -200,7 +222,8 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
             await checkStop();
             const scrollAmount = Math.floor(Math.random() * 600) + 400;
             await page.mouse.wheel(0, scrollAmount);
-            addLog(`Scrolled ${scrollAmount}px and browsing...`);
+            await captureScreenshot(page);
+            await addLog(`Scrolled ${scrollAmount}px and browsing...`);
             await page.waitForTimeout(Math.random() * 2000 + 1500);
         }
 

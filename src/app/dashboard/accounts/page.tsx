@@ -22,6 +22,13 @@ export default function AccountsPage() {
     const [newUsername, setNewUsername] = useState("");
     const [newPassword, setNewPassword] = useState("");
     const [warmingId, setWarmingId] = useState<string | null>(null);
+    const [debugMode, setDebugMode] = useState(false);
+
+    // Live Session Modal
+    const [liveAccount, setLiveAccount] = useState<any>(null);
+    const [liveLogs, setLiveLogs] = useState<string[]>([]);
+    const [liveScreenshot, setLiveScreenshot] = useState<string | null>(null);
+    const [isPolling, setIsPolling] = useState(false);
 
     // Fetch real accounts
     const fetchAccounts = async () => {
@@ -93,20 +100,50 @@ export default function AccountsPage() {
         try {
             const res = await fetch(`/api/accounts/reddit/${id}/warmup`, {
                 method: "POST",
-                body: JSON.stringify({ debugMode: false }),
+                body: JSON.stringify({ debugMode }),
             });
             const data = await res.json();
 
             if (!res.ok) throw new Error(data.error || "Warmup failed");
 
-            toast.success("Warmup session completed!");
+            toast.success("Warmup session started!");
             fetchAccounts();
+
+            // Open live view automatically if debug is on
+            if (debugMode) {
+                const acc = accounts.find(a => a.id === id);
+                if (acc) handleViewLive(acc);
+            }
         } catch (error: any) {
             toast.error(error.message);
         } finally {
             setWarmingId(null);
         }
     };
+
+    const handleViewLive = (account: any) => {
+        setLiveAccount(account);
+        setIsPolling(true);
+    };
+
+    useEffect(() => {
+        let interval: NodeJS.Timeout;
+        if (isPolling && liveAccount) {
+            const poll = async () => {
+                try {
+                    const res = await fetch(`/api/accounts/reddit/${liveAccount.id}/live`);
+                    if (res.ok) {
+                        const data = await res.json();
+                        setLiveLogs(data.logs || []);
+                        setLiveScreenshot(data.screenshot || null);
+                    }
+                } catch (e) { }
+            };
+            poll();
+            interval = setInterval(poll, 3000);
+        }
+        return () => clearInterval(interval);
+    }, [isPolling, liveAccount]);
 
     return (
         <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -133,7 +170,7 @@ export default function AccountsPage() {
                     >
                         <div className="glass-panel p-6 rounded-2xl border-primary/30">
                             <h3 className="text-lg font-bold text-foreground mb-4">Connect New Account</h3>
-                            <form onSubmit={handleAdd} className="flex flex-col md:flex-row gap-4">
+                            <div className="flex flex-col md:flex-row gap-4">
                                 <input
                                     type="text"
                                     required
@@ -150,6 +187,18 @@ export default function AccountsPage() {
                                     onChange={(e) => setNewPassword(e.target.value)}
                                     className="flex-1 bg-secondary border border-border rounded-xl px-4 py-3 text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary placeholder:text-muted-foreground"
                                 />
+                                <div className="flex items-center gap-2 px-4 py-3 bg-secondary border border-border rounded-xl">
+                                    <input
+                                        type="checkbox"
+                                        id="debugMode"
+                                        checked={debugMode}
+                                        onChange={(e) => setDebugMode(e.target.checked)}
+                                        className="w-4 h-4 accent-primary"
+                                    />
+                                    <label htmlFor="debugMode" className="text-sm font-medium text-foreground cursor-pointer">
+                                        Debug Mode
+                                    </label>
+                                </div>
                                 <div className="flex gap-2">
                                     <button
                                         type="button"
@@ -166,7 +215,7 @@ export default function AccountsPage() {
                                         {isActionLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : "Connect"}
                                     </button>
                                 </div>
-                            </form>
+                            </div>
                             <div className="mt-4 flex items-center gap-2 text-sm text-yellow-600 bg-yellow-500/10 p-3 rounded-lg border border-yellow-500/20">
                                 <ShieldAlert className="w-4 h-4" />
                                 <p>We use end-to-end encryption. Your credentials are never stored in plain text.</p>
@@ -225,6 +274,22 @@ export default function AccountsPage() {
                                         <td className="p-4 text-foreground/80">{acc.accountAge}</td>
                                         <td className="p-4 text-right">
                                             <div className="flex items-center justify-end gap-2">
+                                                {(acc.status === 'warming' || acc.status === 'warmup') && (
+                                                    <button
+                                                        onClick={() => handleViewLive(acc)}
+                                                        className="px-3 py-1.5 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 transition-all text-xs font-bold uppercase"
+                                                    >
+                                                        Live View
+                                                    </button>
+                                                )}
+                                                <button
+                                                    onClick={() => handleWarmup(acc.id)}
+                                                    disabled={warmingId === acc.id || isActionLoading}
+                                                    className="p-2 text-muted-foreground hover:text-primary hover:bg-primary/10 rounded-lg transition-colors inline-flex disabled:opacity-50"
+                                                    title="Start Warmup"
+                                                >
+                                                    {warmingId === acc.id ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5" />}
+                                                </button>
                                                 <button
                                                     onClick={() => handleDelete(acc.id)}
                                                     disabled={isActionLoading}
@@ -242,6 +307,95 @@ export default function AccountsPage() {
                     </table>
                 </div>
             </div>
+
+            {/* Live Session Modal */}
+            <AnimatePresence>
+                {liveAccount && (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-background/80 backdrop-blur-sm">
+                        <motion.div
+                            initial={{ opacity: 0, scale: 0.95 }}
+                            animate={{ opacity: 1, scale: 1 }}
+                            exit={{ opacity: 0, scale: 0.95 }}
+                            className="w-full max-w-4xl max-h-[90vh] glass-panel rounded-3xl overflow-hidden border-primary/20 shadow-2xl flex flex-col"
+                        >
+                            <div className="p-6 border-b border-border flex items-center justify-between bg-secondary/30">
+                                <div>
+                                    <h2 className="text-xl font-bold text-foreground">Live Bot Session: @{liveAccount.username}</h2>
+                                    <p className="text-sm text-muted-foreground">Monitoring bot actions in real-time</p>
+                                </div>
+                                <button
+                                    onClick={() => {
+                                        setIsPolling(false);
+                                        setLiveAccount(null);
+                                    }}
+                                    className="p-2 hover:bg-secondary rounded-full transition-colors"
+                                >
+                                    <ShieldAlert className="w-6 h-6 rotate-45" />
+                                </button>
+                            </div>
+
+                            <div className="flex-1 overflow-auto p-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+                                {/* Screenshot Section */}
+                                <div className="space-y-4">
+                                    <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">Live Screenshot</h3>
+                                    <div className="aspect-video bg-black rounded-xl border border-border overflow-hidden relative group">
+                                        {liveScreenshot ? (
+                                            <img
+                                                src={liveScreenshot}
+                                                alt="Bot Screenshot"
+                                                className="w-full h-full object-contain"
+                                            />
+                                        ) : (
+                                            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-muted-foreground">
+                                                <Loader2 className="w-8 h-8 animate-spin" />
+                                                <p className="text-sm">Waiting for first image...</p>
+                                            </div>
+                                        )}
+                                        {liveScreenshot && (
+                                            <div className="absolute bottom-2 right-2 bg-black/60 text-white text-[10px] px-2 py-1 rounded">
+                                                Live View Enabled
+                                            </div>
+                                        )}
+                                    </div>
+                                    <p className="text-xs text-muted-foreground italic">
+                                        * Note: Screenshots refresh every 3 seconds for privacy and performance.
+                                    </p>
+                                </div>
+
+                                {/* Logs Section */}
+                                <div className="space-y-4 flex flex-col h-full">
+                                    <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">Session Logs</h3>
+                                    <div className="flex-1 bg-black/90 rounded-xl p-4 font-mono text-xs text-green-400 overflow-auto border border-white/10 space-y-1.5 custom-scrollbar min-h-[300px]">
+                                        {liveLogs.length > 0 ? (
+                                            liveLogs.map((log, i) => (
+                                                <div key={i} className="flex gap-2">
+                                                    <span className="opacity-50 text-[10px] shrink-0">{i + 1}</span>
+                                                    <span>{log}</span>
+                                                </div>
+                                            ))
+                                        ) : (
+                                            <p className="text-muted-foreground opacity-50 italic">Waiting for logs...</p>
+                                        )}
+                                        <div className="h-1 w-full" /> {/* Bottom spacer for auto-scroll */}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="p-4 bg-secondary/50 border-t border-border flex justify-end">
+                                <button
+                                    onClick={() => {
+                                        setIsPolling(false);
+                                        setLiveAccount(null);
+                                    }}
+                                    className="px-6 py-2 rounded-xl bg-primary text-primary-foreground font-bold hover:bg-primary/90 transition-all"
+                                >
+                                    Close Live View
+                                </button>
+                            </div>
+                        </motion.div>
+                    </div>
+                )}
+            </AnimatePresence>
         </div>
     );
 }

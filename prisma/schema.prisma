@@ -94,6 +94,8 @@ model RedditAccount {
   karma       Int      @default(0)
   accountAge  Int?     // Days
   browserCookies String? // JSON: stored cookies for session persistence across restarts
+  lastDebugScreenshot String? // Base64 or URL of the latest screenshot
+  lastDebugLogs   String? // JSON string array of the latest logs
   projectId   String
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

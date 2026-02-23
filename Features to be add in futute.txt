@@ -1,12 +1,14 @@
 features to be add:
 yr wo UI  UX FULL ACHA BNANA HE ANIMATIONS KE SATH(completed)
 auto reply ko full featue complete krna(completed)
-posts create krne by ai aur by yourself wo post jo un subreddits pr laganyu he promotional ke lye 
+karma  btaye age  btaye (completed)
+ur jb bnda ke karma less than 100 ho aur wo promorion wala jo he auto reply ya posts in me se jo bhi  feature use krne laga ho uske aik warnng show hoke wo wam up wala fwature pehle use krle uske karma kam he (completed))
 
+
+posts create krne by ai aur by yourself wo post jo un subreddits pr laganyu he promotional ke lye 
 schedule posts ka 
 
 
 
 
-karma  btaye age  btaye (completed)
-aur jb bnda ke karma less than 100 ho aur wo promorion wala jo he auto reply ya posts in me se jo bhi  feature use krne laga ho uske aik warnng show hoke wo wam up wala fwature pehle use krle uske karma kam he 
+
