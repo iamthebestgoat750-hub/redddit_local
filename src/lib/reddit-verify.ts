@@ -54,6 +54,9 @@ export async function verifyRedditCredentials(username: string, password: string
         context = await chromium.launchPersistentContext(sessionPath, {
             headless: headless,
             slowMo: 50,
+            proxy: process.env.PROXY_URL ? {
+                server: process.env.PROXY_URL,
+            } : undefined,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',

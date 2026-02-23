@@ -70,6 +70,9 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
         context = await chromium.launchPersistentContext(sessionPath, {
             headless: headless,
             slowMo: 100,
+            proxy: process.env.PROXY_URL ? {
+                server: process.env.PROXY_URL,
+            } : undefined,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
