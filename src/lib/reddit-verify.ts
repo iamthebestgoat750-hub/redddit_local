@@ -1,6 +1,7 @@
 import { chromium, BrowserContext, Page, Cookie } from "playwright";
 import { fetchRedditProfileStats } from "./reddit-actions";
 import { getTempSessionPath } from "./session-manager";
+import { prisma } from "@/lib/db";
 
 export interface VerificationResult {
     success: boolean;
@@ -8,11 +9,37 @@ export interface VerificationResult {
     username?: string;
     karma?: number;
     accountAge?: number;
-    cookies?: Cookie[]; // Return cookies so API can save them to DB
+    cookies?: Cookie[];
 }
 
+// Save screenshot to DB for dashboard Live View
+async function saveScreenshotToDb(accountId: string, page: Page) {
+    try {
+        const screenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
+        const base64 = `data:image/jpeg;base64,${screenshot.toString('base64')}`;
+        await (prisma as any).redditAccount.update({
+            where: { id: accountId },
+            data: { lastDebugScreenshot: base64 }
+        });
+    } catch (e) { }
+}
 
-export async function verifyRedditCredentials(username: string, password: string, headless: boolean = true): Promise<VerificationResult> {
+async function saveLogToDb(accountId: string, msg: string) {
+    try {
+        const acc = await (prisma as any).redditAccount.findUnique({
+            where: { id: accountId },
+            select: { lastDebugLogs: true }
+        });
+        const existing: string[] = acc?.lastDebugLogs ? JSON.parse(acc.lastDebugLogs) : [];
+        const timestamp = new Date().toLocaleTimeString();
+        existing.push(`${timestamp}: ${msg}`);
+        await (prisma as any).redditAccount.update({
+            where: { id: accountId },
+            data: { lastDebugLogs: JSON.stringify(existing.slice(-50)) }
+        });
+    } catch (e) { }
+}
+export async function verifyRedditCredentials(username: string, password: string, headless: boolean = true, accountId?: string): Promise<VerificationResult> {
     let context: BrowserContext | undefined;
     let step = "init";
 
@@ -79,10 +106,16 @@ export async function verifyRedditCredentials(username: string, password: string
         });
 
         step = "check_session";
+        console.log(`[DEBUG] Navigating to reddit.com for session check...`);
         try {
             await page.goto("https://www.reddit.com/", { waitUntil: 'domcontentloaded', timeout: 30000 });
         } catch (e) {
-            console.warn(`[DEBUG] Initial load timeout for session check, proceeding with Race...`);
+            console.warn(`[DEBUG] Initial load timeout, proceeding...`);
+        }
+
+        if (accountId) {
+            await saveScreenshotToDb(accountId, page);
+            await saveLogToDb(accountId, "📸 Step 1: Opened reddit.com - checking session...");
         }
 
         const isDetected = await Promise.race([
@@ -94,33 +127,56 @@ export async function verifyRedditCredentials(username: string, password: string
             const v = await verifySession(username);
             if (v.success) {
                 console.log(`[DEBUG] Already logged in via persistent session for ${v.name}`);
+                if (accountId) await saveLogToDb(accountId, `✅ Already logged in as @${v.name}`);
                 const cookies = await context.cookies();
                 return { success: true, username: v.name, cookies };
             }
         }
 
-        // 1. Navigate to Login
+        // Step 2: Click "Log In" button on the homepage navbar
         step = "navigate";
-        console.log(`[DEBUG] Navigating to login page...`);
+        console.log(`[DEBUG] Clicking Log In button on homepage...`);
         try {
-            await page.goto("https://www.reddit.com/login", { waitUntil: 'domcontentloaded', timeout: 30000 });
-        } catch (e: any) {
-            console.error(`[DEBUG] Navigation failed: ${e.message}`);
-            return { success: false, error: `Could not reach Reddit login page. (Network error)` };
+            const loginBtn = await page.waitForSelector(
+                'a[href*="/login"], a:has-text("Log In"), button:has-text("Log In"), #login-link',
+                { timeout: 10000 }
+            );
+            await loginBtn!.click();
+            console.log(`[DEBUG] Clicked Log In button - waiting for login page...`);
+            await page.waitForURL(/login/, { timeout: 15000 }).catch(() => { });
+        } catch {
+            // Fallback: navigate directly to /login
+            console.warn(`[DEBUG] Login button not found on homepage, navigating directly to /login...`);
+            try {
+                await page.goto("https://www.reddit.com/login", { waitUntil: 'domcontentloaded', timeout: 30000 });
+            } catch (e: any) {
+                return { success: false, error: `Could not reach Reddit login page. (Network error)` };
+            }
         }
 
-        // 2. Fill credentials
+        if (accountId) {
+            await saveScreenshotToDb(accountId, page);
+            await saveLogToDb(accountId, "📸 Step 2: Login page opened - filling credentials...");
+        }
+
+        // Step 3: Fill credentials
         step = "fill";
         console.log(`[DEBUG] Filling credentials...`);
         try {
             const userSelector = 'input[name="username"], #login-username, [placeholder*="username"]';
             const passSelector = 'input[name="password"], #login-password, [placeholder*="Password"]';
 
+            await page.waitForSelector(userSelector, { timeout: 10000 });
             await page.click(userSelector);
             await page.keyboard.type(username, { delay: 150 });
 
             await page.click(passSelector);
             await page.keyboard.type(password.toString(), { delay: 150 });
+
+            if (accountId) {
+                await saveScreenshotToDb(accountId, page);
+                await saveLogToDb(accountId, "📸 Step 3: Credentials filled - submitting...");
+            }
         } catch (e: any) {
             console.error(`[DEBUG] Form detection/fill failed: ${e.message}`);
             return { success: false, error: "Reddit login form interaction failed. Please try again." };
@@ -131,87 +187,81 @@ export async function verifyRedditCredentials(username: string, password: string
         console.log(`[DEBUG] Clicking login...`);
         await page.click('button[type="submit"], button:has-text("Log In")');
 
-        // 4. Wait for response or error
+        // 4. Wait for response or error — parallel detection with short timeout
         step = "wait-result";
         try {
             console.log(`[DEBUG] Waiting for login result...`);
 
-            const checkResult = async () => {
-                const success = await page.waitForURL((url) => url.toString().includes("reddit.com") && !url.toString().includes("login") && !url.toString().includes("register"), { timeout: 300000 }).then(() => "success").catch(() => null);
-                if (success) return success;
+            const result = await Promise.race([
+                // Success: navigated away from login page
+                page.waitForURL(
+                    (url) => url.toString().includes("reddit.com") && !url.toString().includes("login") && !url.toString().includes("register"),
+                    { timeout: 30000 }
+                ).then(() => "success"),
 
-                const error = await page.waitForSelector('[role="alert"], .AnimatedForm__errorMessage, :text("Incorrect username or password"), :text("Invalid username or password")', { timeout: 5000 }).then(() => "error").catch(() => null);
-                if (error) return error;
+                // Wrong credentials
+                page.waitForSelector(
+                    '[role="alert"], .AnimatedForm__errorMessage, :text("Incorrect username"), :text("Invalid username")',
+                    { timeout: 30000 }
+                ).then(() => "error"),
 
-                const captcha = await page.waitForSelector('iframe[title="reCAPTCHA"]', { timeout: 5000 }).then(() => "captcha").catch(() => null);
-                if (captcha) return captcha;
-
-                return "timeout";
-            };
-
-            let result = await checkResult();
-
-            if ((result === "timeout" || result === "captcha") && !headless) {
-                console.log("[DEBUG] Visible Mode: Waiting for user manual intervention (CAPTCHA?)...");
-                try {
-                    await page.waitForURL((url) => url.toString() === "https://www.reddit.com/" || url.toString().includes("/user/"), { timeout: 120000 });
-                    result = "success";
-                } catch {
-                    if (result === "captcha") return { success: false, error: "CAPTCHA not solved in time. Please try again." };
-                }
-            }
+                // CAPTCHA detected
+                page.waitForSelector(
+                    'iframe[title="reCAPTCHA"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .g-recaptcha',
+                    { timeout: 30000 }
+                ).then(() => "captcha"),
+            ]).catch(() => "timeout");
 
             console.log(`[DEBUG] Result detected: ${result}`);
+
+            if (result === "captcha") {
+                return {
+                    success: false,
+                    error: "❌ CAPTCHA detected on Railway server IP. Reddit is blocking automated logins from this server. Please try again later or use a different network."
+                };
+            }
+
+            if (result === "timeout") {
+                return {
+                    success: false,
+                    error: "❌ Login timed out (30s). Reddit may be showing a CAPTCHA or is slow. Check Railway logs for [DEBUG] messages."
+                };
+            }
 
             if (result === "error") {
                 const errorText = await page.locator('[role="alert"], .AnimatedForm__errorMessage').first().innerText().catch(() => "Invalid username or password");
                 return { success: false, error: errorText };
             }
 
-            if (result === "captcha" && headless) {
-                return { success: false, error: "CAPTCHA detected. Please use 'Show Browser' mode to solve it manually." };
-            }
-
+            // result === "success"
             const v = await verifySession(username);
 
-            if (result === "success" || v.success) {
-                if (page.url().includes("/login")) {
-                    return { success: false, error: "Login flow incomplete. Still on login page." };
-                }
+            let finalUsername = v.name || username;
 
-                let finalUsername = v.name || username;
-
-                if (!v.success && !username.includes('@')) {
-                    return { success: false, error: "API verification failed after login." };
-                }
-
-                if (username.includes("@") && !v.name) {
-                    console.log("[DEBUG] Email used and API check failed to return name. Fetching real username via /user/me...");
-                    try {
-                        await page.goto("https://www.reddit.com/user/me", { waitUntil: 'domcontentloaded' });
-                        const url = page.url();
-                        if (url.includes("/user/")) {
-                            finalUsername = url.split("/user/")[1].split("/")[0];
-                            console.log(`[DEBUG] Detected username: ${finalUsername}`);
-                        }
-                    } catch (e) {
-                        console.error("[DEBUG] Failed to fetch username from /user/me");
+            if (username.includes("@") && !v.name) {
+                console.log("[DEBUG] Email used - fetching username via /user/me...");
+                try {
+                    await page.goto("https://www.reddit.com/user/me", { waitUntil: 'domcontentloaded' });
+                    const url = page.url();
+                    if (url.includes("/user/")) {
+                        finalUsername = url.split("/user/")[1].split("/")[0];
+                        console.log(`[DEBUG] Detected username: ${finalUsername}`);
                     }
+                } catch (e) {
+                    console.error("[DEBUG] Failed to fetch username from /user/me");
                 }
-
-                const stats = await fetchRedditProfileStats(page).catch(() => null);
-                const cookies = await context.cookies();
-
-                return {
-                    success: true,
-                    username: finalUsername,
-                    karma: stats?.karma || 0,
-                    accountAge: stats?.ageDays || 0,
-                    cookies: cookies
-                };
             }
 
-            return { success: false, error: "Login failed or timed out. Please try Visible Mode." };
+            const stats = await fetchRedditProfileStats(page).catch(() => null);
+            const cookies = await context.cookies();
+
+            return {
+                success: true,
+                username: finalUsername,
+                karma: stats?.karma || 0,
+                accountAge: stats?.ageDays || 0,
+                cookies: cookies
+            };
 
         } catch (e: any) {
             console.error(`[DEBUG] Error during result waiting: ${e.message}`);
