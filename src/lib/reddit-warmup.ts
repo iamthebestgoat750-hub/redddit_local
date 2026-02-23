@@ -2,7 +2,7 @@ import { chromium, BrowserContext, Page } from "playwright";
 import { prisma } from "@/lib/db";
 import { decrypt } from "@/lib/encryption";
 import { askGemini } from "@/lib/gemini";
-import { getTempSessionPath, saveCookiesToDb } from "@/lib/session-manager";
+import { getTempSessionPath, saveCookiesToDb, loadCookiesFromDb } from "@/lib/session-manager";
 
 export interface WarmupResult {
     success: boolean;
@@ -64,6 +64,16 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
         });
 
         const page = context.pages()[0] || await context.newPage();
+
+        // ✅ CRITICAL: Load cookies from DB into browser BEFORE any navigation
+        // This means if we saved cookies during account add (API login) or a previous warmup,
+        // the browser is already logged in — no fresh login, no CAPTCHA!
+        const cookiesLoaded = await loadCookiesFromDb(accountId, context);
+        if (cookiesLoaded) {
+            addLog("✅ Restored session from database — skipping login!");
+        } else {
+            addLog("No saved cookies found. Will attempt browser login...");
+        }
 
         // ENHANCED STEALTH: Mock more browser properties
         await page.addInitScript(() => {
