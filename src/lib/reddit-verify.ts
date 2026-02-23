@@ -1,4 +1,6 @@
-import { Cookie } from "playwright";
+import { chromium, BrowserContext, Page, Cookie } from "playwright";
+import { fetchRedditProfileStats } from "./reddit-actions";
+import { getTempSessionPath } from "./session-manager";
 
 export interface VerificationResult {
     success: boolean;
@@ -6,171 +8,220 @@ export interface VerificationResult {
     username?: string;
     karma?: number;
     accountAge?: number;
-    cookies?: Cookie[];
+    cookies?: Cookie[]; // Return cookies so API can save them to DB
 }
 
-/**
- * Logs into Reddit using the old.reddit.com JSON API.
- * No browser launched → No CAPTCHA possible.
- * Returns session cookies that can be injected into Playwright later.
- */
-export async function verifyRedditCredentials(
-    username: string,
-    password: string,
-    _headless: boolean = true
-): Promise<VerificationResult> {
 
-    console.log(`[VERIFY] Starting API login for ${username}...`);
+export async function verifyRedditCredentials(username: string, password: string, headless: boolean = true): Promise<VerificationResult> {
+    let context: BrowserContext | undefined;
+    let step = "init";
 
-    // ── STEP 1: Get initial cookies (session context) ──────────────────────
-    let initCookieStr = "";
+    // Use temp path (ephemeral)
+    const sessionPath = getTempSessionPath(username);
+
     try {
-        const initRes = await fetch("https://old.reddit.com/login", {
-            headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml",
-            },
-        });
-        const initCookies = initRes.headers.getSetCookie?.() ?? [];
-        initCookieStr = initCookies.map(c => c.split(";")[0]).join("; ");
-    } catch (e: any) {
-        console.warn(`[VERIFY] Could not get init cookies: ${e.message}`);
-    }
+        console.log(`[DEBUG] Starting verification for ${username} (Headless: ${headless})`);
+        step = "launch";
 
-    // ── STEP 2: POST login via Reddit JSON API ─────────────────────────────
-    try {
-        const body = new URLSearchParams({
-            user: username,
-            passwd: password,
-            api_type: "json",
-            rem: "true",
+        context = await chromium.launchPersistentContext(sessionPath, {
+            headless: headless,
+            slowMo: 50,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--disable-extensions'
+            ],
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            viewport: { width: 1366, height: 768 }
         });
 
-        const loginRes = await fetch("https://old.reddit.com/api/login", {
-            method: "POST",
-            headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Cookie": initCookieStr,
-                "Origin": "https://old.reddit.com",
-                "Referer": "https://old.reddit.com/login",
-                "X-Requested-With": "XMLHttpRequest",
-            },
-            body: body.toString(),
+        const page = context.pages()[0] || await context.newPage();
+
+        async function verifySession(expectedUser: string): Promise<{ success: boolean; name?: string }> {
+            try {
+                await page.waitForTimeout(2000);
+                const apiData = await page.evaluate(async () => {
+                    try {
+                        const res = await fetch('https://www.reddit.com/api/me.json', { credentials: 'include' });
+                        if (res.ok) {
+                            const json = await res.json();
+                            return json.data;
+                        }
+                    } catch { }
+                    return null;
+                });
+                if (apiData && apiData.name) {
+                    const actualName = apiData.name.toLowerCase();
+                    const expected = expectedUser.toLowerCase();
+                    if (username.includes('@') || actualName === expected) {
+                        return { success: true, name: apiData.name };
+                    }
+                }
+            } catch { }
+            return { success: false };
+        }
+
+        // ENHANCED STEALTH: Mock more browser properties
+        await page.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            (window as any).chrome = { runtime: {} };
+            const originalQuery = window.navigator.permissions.query;
+            (window.navigator.permissions as any).query = (parameters: any) =>
+                parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters);
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
         });
 
-        const data = await loginRes.json() as any;
-        console.log(`[VERIFY] API response:`, JSON.stringify(data).slice(0, 300));
+        step = "check_session";
+        try {
+            await page.goto("https://www.reddit.com/", { waitUntil: 'domcontentloaded', timeout: 30000 });
+        } catch (e) {
+            console.warn(`[DEBUG] Initial load timeout for session check, proceeding with Race...`);
+        }
 
-        // ── Wrong password ──────────────────────────────────────────────────
-        if (data?.json?.errors?.length > 0) {
-            const errCode = data.json.errors[0]?.[0];
-            const errMsg = data.json.errors[0]?.[1] || "Invalid username or password";
+        const isDetected = await Promise.race([
+            page.waitForSelector('shreddit-async-loader[bundlename="user_menu"], #nav-user-menu, a[href*="/user/"], [aria-label*="User menu"]', { timeout: 15000 }).then(() => true),
+            page.waitForSelector('a[href*="/login"], button:has-text("Log In"), #login-link', { timeout: 15000 }).then(() => false)
+        ]).catch(() => false);
 
-            if (errCode === "WRONG_PASSWORD" || errCode === "INVALID_USERNAME") {
-                return { success: false, error: "Incorrect username or password. Please double-check." };
+        if (isDetected) {
+            const v = await verifySession(username);
+            if (v.success) {
+                console.log(`[DEBUG] Already logged in via persistent session for ${v.name}`);
+                const cookies = await context.cookies();
+                return { success: true, username: v.name, cookies };
             }
-            return { success: false, error: errMsg };
         }
 
-        // ── Success ─────────────────────────────────────────────────────────
-        if (data?.json?.data?.modhash) {
-            const loginCookies = loginRes.headers.getSetCookie?.() ?? [];
-            const allRawCookies = [...initCookieStr.split("; ").map(kv => kv + "; Domain=.reddit.com"), ...loginCookies];
-
-            // Resolve actual username (needed if they logged in with email)
-            let finalUsername = username.includes("@")
-                ? await resolveUsernameViaApi(loginCookies, data.json.data.modhash)
-                : (data.json.data.need_https !== undefined ? username : username);
-
-            // Validate: also pull karma & age from public API
-            const { karma, accountAge } = await getPublicStats(finalUsername);
-
-            // Convert raw Set-Cookie headers → Playwright Cookie format
-            const cookies = parseCookies(loginCookies);
-
-            console.log(`[VERIFY] ✅ Login OK — u/${finalUsername}, karma: ${karma}`);
-            return { success: true, username: finalUsername, karma, accountAge, cookies };
+        // 1. Navigate to Login
+        step = "navigate";
+        console.log(`[DEBUG] Navigating to login page...`);
+        try {
+            await page.goto("https://www.reddit.com/login", { waitUntil: 'domcontentloaded', timeout: 30000 });
+        } catch (e: any) {
+            console.error(`[DEBUG] Navigation failed: ${e.message}`);
+            return { success: false, error: `Could not reach Reddit login page. (Network error)` };
         }
 
-        // ── API returned OK but no modhash (edge case) ──────────────────────
-        return { success: false, error: "Reddit did not return a session. Please check credentials and try again." };
+        // 2. Fill credentials
+        step = "fill";
+        console.log(`[DEBUG] Filling credentials...`);
+        try {
+            const userSelector = 'input[name="username"], #login-username, [placeholder*="username"]';
+            const passSelector = 'input[name="password"], #login-password, [placeholder*="Password"]';
 
-    } catch (err: any) {
-        console.error(`[VERIFY] API login error: ${err.message}`);
-        // Fall back to public username check so user isn't completely blocked
-        return await fallbackPublicCheck(username);
-    }
-}
+            await page.click(userSelector);
+            await page.keyboard.type(username, { delay: 150 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function resolveUsernameViaApi(cookies: string[], modhash: string): Promise<string> {
-    try {
-        const cookieStr = cookies.map(c => c.split(";")[0]).join("; ");
-        const res = await fetch("https://www.reddit.com/api/me.json", {
-            headers: {
-                "Cookie": cookieStr,
-                "X-Modhash": modhash,
-                "User-Agent": "Mozilla/5.0",
-            },
-        });
-        const data = await res.json() as any;
-        return data?.data?.name || "unknown";
-    } catch {
-        return "unknown";
-    }
-}
-
-async function getPublicStats(username: string): Promise<{ karma: number; accountAge: number }> {
-    try {
-        const res = await fetch(`https://www.reddit.com/user/${encodeURIComponent(username)}/about.json`, {
-            headers: { "User-Agent": "Mozilla/5.0" },
-        });
-        if (!res.ok) return { karma: 0, accountAge: 0 };
-        const data = await res.json() as any;
-        const ud = data?.data;
-        return {
-            karma: (ud?.link_karma || 0) + (ud?.comment_karma || 0),
-            accountAge: ud?.created_utc ? Math.floor((Date.now() / 1000 - ud.created_utc) / 86400) : 0,
-        };
-    } catch {
-        return { karma: 0, accountAge: 0 };
-    }
-}
-
-function parseCookies(rawHeaders: string[]): Cookie[] {
-    return rawHeaders.map(c => {
-        const [nameVal] = c.split(";");
-        const eqIdx = nameVal.indexOf("=");
-        return {
-            name: nameVal.slice(0, eqIdx).trim(),
-            value: nameVal.slice(eqIdx + 1).trim(),
-            domain: ".reddit.com",
-            path: "/",
-            expires: -1,
-            httpOnly: false,
-            secure: true,
-            sameSite: "Lax" as const,
-        };
-    }).filter(c => c.name && c.value);
-}
-
-async function fallbackPublicCheck(username: string): Promise<VerificationResult> {
-    if (username.includes("@")) {
-        return { success: true, username, karma: 0, accountAge: 0 };
-    }
-    try {
-        const res = await fetch(`https://www.reddit.com/user/${encodeURIComponent(username)}/about.json`, {
-            headers: { "User-Agent": "Mozilla/5.0" },
-        });
-        if (res.status === 404) {
-            return { success: false, error: `User u/${username} does not exist on Reddit.` };
+            await page.click(passSelector);
+            await page.keyboard.type(password.toString(), { delay: 150 });
+        } catch (e: any) {
+            console.error(`[DEBUG] Form detection/fill failed: ${e.message}`);
+            return { success: false, error: "Reddit login form interaction failed. Please try again." };
         }
-        return { success: true, username, karma: 0, accountAge: 0 };
-    } catch {
-        return { success: true, username, karma: 0, accountAge: 0 };
+
+        // 3. Submit
+        step = "submit";
+        console.log(`[DEBUG] Clicking login...`);
+        await page.click('button[type="submit"], button:has-text("Log In")');
+
+        // 4. Wait for response or error
+        step = "wait-result";
+        try {
+            console.log(`[DEBUG] Waiting for login result...`);
+
+            const checkResult = async () => {
+                const success = await page.waitForURL((url) => url.toString().includes("reddit.com") && !url.toString().includes("login") && !url.toString().includes("register"), { timeout: 300000 }).then(() => "success").catch(() => null);
+                if (success) return success;
+
+                const error = await page.waitForSelector('[role="alert"], .AnimatedForm__errorMessage, :text("Incorrect username or password"), :text("Invalid username or password")', { timeout: 5000 }).then(() => "error").catch(() => null);
+                if (error) return error;
+
+                const captcha = await page.waitForSelector('iframe[title="reCAPTCHA"]', { timeout: 5000 }).then(() => "captcha").catch(() => null);
+                if (captcha) return captcha;
+
+                return "timeout";
+            };
+
+            let result = await checkResult();
+
+            if ((result === "timeout" || result === "captcha") && !headless) {
+                console.log("[DEBUG] Visible Mode: Waiting for user manual intervention (CAPTCHA?)...");
+                try {
+                    await page.waitForURL((url) => url.toString() === "https://www.reddit.com/" || url.toString().includes("/user/"), { timeout: 120000 });
+                    result = "success";
+                } catch {
+                    if (result === "captcha") return { success: false, error: "CAPTCHA not solved in time. Please try again." };
+                }
+            }
+
+            console.log(`[DEBUG] Result detected: ${result}`);
+
+            if (result === "error") {
+                const errorText = await page.locator('[role="alert"], .AnimatedForm__errorMessage').first().innerText().catch(() => "Invalid username or password");
+                return { success: false, error: errorText };
+            }
+
+            if (result === "captcha" && headless) {
+                return { success: false, error: "CAPTCHA detected. Please use 'Show Browser' mode to solve it manually." };
+            }
+
+            const v = await verifySession(username);
+
+            if (result === "success" || v.success) {
+                if (page.url().includes("/login")) {
+                    return { success: false, error: "Login flow incomplete. Still on login page." };
+                }
+
+                let finalUsername = v.name || username;
+
+                if (!v.success && !username.includes('@')) {
+                    return { success: false, error: "API verification failed after login." };
+                }
+
+                if (username.includes("@") && !v.name) {
+                    console.log("[DEBUG] Email used and API check failed to return name. Fetching real username via /user/me...");
+                    try {
+                        await page.goto("https://www.reddit.com/user/me", { waitUntil: 'domcontentloaded' });
+                        const url = page.url();
+                        if (url.includes("/user/")) {
+                            finalUsername = url.split("/user/")[1].split("/")[0];
+                            console.log(`[DEBUG] Detected username: ${finalUsername}`);
+                        }
+                    } catch (e) {
+                        console.error("[DEBUG] Failed to fetch username from /user/me");
+                    }
+                }
+
+                const stats = await fetchRedditProfileStats(page).catch(() => null);
+                const cookies = await context.cookies();
+
+                return {
+                    success: true,
+                    username: finalUsername,
+                    karma: stats?.karma || 0,
+                    accountAge: stats?.ageDays || 0,
+                    cookies: cookies
+                };
+            }
+
+            return { success: false, error: "Login failed or timed out. Please try Visible Mode." };
+
+        } catch (e: any) {
+            console.error(`[DEBUG] Error during result waiting: ${e.message}`);
+            return { success: false, error: "Verification timed out. Reddit is not responding." };
+        }
+
+    } catch (error: any) {
+        console.error(`[DEBUG] Playwright error at step [${step}]:`, error);
+        return { success: false, error: `Verification System Error: [${step}] ${error.message || "Unknown error"}` };
+    } finally {
+        if (context) await context.close();
     }
 }

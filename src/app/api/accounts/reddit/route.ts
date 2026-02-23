@@ -101,15 +101,10 @@ export async function POST(req: Request) {
 
         const encryptedPassword = encrypt(password);
 
-        // Save session cookies to DB if API login returned them
-        // This means warmup/discovery won't need a fresh browser login (no CAPTCHA!)
+        // Save session cookies if browser login returned them (local mode)
         const browserCookiesJson = verification.cookies && verification.cookies.length > 0
             ? JSON.stringify(verification.cookies)
             : null;
-
-        if (browserCookiesJson) {
-            console.log(`Saving ${verification.cookies!.length} session cookies to DB for ${verifiedUsername}`);
-        }
 
         const account = await prisma.redditAccount.create({
             data: {
@@ -130,6 +125,7 @@ export async function POST(req: Request) {
                 username: account.username,
             },
         });
+
     } catch (error) {
         console.error("Reddit connection error:", error);
         return NextResponse.json({ error: "Failed to connect account" }, { status: 500 });
