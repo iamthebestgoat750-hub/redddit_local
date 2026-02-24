@@ -13,14 +13,27 @@ export interface VerificationResult {
 }
 
 // Human-like random delay
-const humanDelay = (min = 500, max = 1500) =>
+const humanDelay = (min = 1000, max = 3000) =>
     new Promise(r => setTimeout(r, Math.floor(Math.random() * (max - min)) + min));
+
+// Random mouse zig-zag
+async function humanMove(page: Page) {
+    const { width, height } = page.viewportSize() || { width: 1280, height: 720 };
+    for (let i = 0; i < 3; i++) {
+        const x = Math.floor(Math.random() * width);
+        const y = Math.floor(Math.random() * height);
+        await page.mouse.move(x, y, { steps: Math.floor(Math.random() * 10) + 5 });
+        await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
+    }
+}
 
 // Human-like random typing (random delay between each char)
 async function humanType(page: Page, selector: string, text: string) {
     await page.click(selector);
+    await humanDelay(300, 600);
     for (const char of text) {
-        await page.keyboard.type(char, { delay: Math.floor(Math.random() * 120) + 40 });
+        await page.keyboard.type(char, { delay: Math.floor(Math.random() * 150) + 60 });
+        if (Math.random() > 0.9) await humanDelay(200, 400); // Random pause while typing
     }
 }
 
@@ -239,46 +252,49 @@ export async function verifyRedditCredentials(username: string, password: string
 
         // Step 3: Fill credentials on old.reddit.com  
         step = "fill";
-        console.log(`[DEBUG] Filling credentials on old Reddit...`);
+        console.log(`[DEBUG] Filling credentials...`);
+        await humanMove(page); // Move mouse randomly before starting
 
         try {
-            // old.reddit.com has #user_login and #passwd_login
-            const userSelector = '#user_login, input[name="user"], input[name="username"]';
-            const passSelector = '#passwd_login, input[name="passwd"], input[name="password"]';
+            // Check if we are actually on old.reddit or redirected to new UI
+            const isOldUI = await page.$('#user_login').then(el => !!el);
 
-            await page.waitForSelector(userSelector, { timeout: 10000 });
+            if (isOldUI) {
+                const userSelector = '#user_login';
+                const passSelector = '#passwd_login';
 
-            await humanDelay(300, 700);
-            await humanType(page, userSelector, username);
+                await page.waitForSelector(userSelector, { timeout: 5000 });
+                await humanDelay(500, 1000);
+                await humanType(page, userSelector, username);
 
-            await humanDelay(400, 800);
-            await humanType(page, passSelector, password.toString());
+                await humanDelay(600, 1200);
+                await humanMove(page);
+                await humanType(page, passSelector, password.toString());
+            } else {
+                // We are on the new UI (redirected)
+                console.log(`[DEBUG] Redirected to new UI, adapting selectors...`);
+                const userSelector = 'input[name="username"], #login-username';
+                const passSelector = 'input[name="password"], #login-password';
 
-            await humanDelay(500, 1000);
+                await page.waitForSelector(userSelector, { timeout: 10000 });
+                await humanDelay(700, 1500);
+                await humanType(page, userSelector, username);
+
+                await humanDelay(800, 1500);
+                await humanMove(page);
+                await humanType(page, passSelector, password.toString());
+            }
+
+            await humanDelay(1500, 3000); // "Thinking" pause before clicking login
+            await humanMove(page);
 
             if (accountId) {
                 await saveScreenshotToDb(accountId, page);
-                await saveLogToDb(accountId, "📸 Step 3: Credentials filled - clicking login...");
+                await saveLogToDb(accountId, "📸 Step 3: Credentials filled - submitting...");
             }
         } catch (e: any) {
-            // Fallback to new Reddit login
-            console.warn(`[DEBUG] old.reddit form not found, trying new Reddit /login...`);
-            if (accountId) await saveLogToDb(accountId, "⚠️ old.reddit form not found, trying new reddit...");
-
-            try {
-                await page.goto("https://www.reddit.com/login", { waitUntil: 'domcontentloaded', timeout: 30000 });
-                await humanDelay(800, 1500);
-
-                const userSelector = 'input[name="username"], #login-username';
-                const passSelector = 'input[name="password"], #login-password';
-                await page.waitForSelector(userSelector, { timeout: 10000 });
-                await humanType(page, userSelector, username);
-                await humanDelay(400, 800);
-                await humanType(page, passSelector, password.toString());
-                await humanDelay(500, 1000);
-            } catch (e2: any) {
-                return { success: false, error: "Reddit login form interaction failed." };
-            }
+            console.warn(`[DEBUG] Fill failed: ${e.message}`);
+            return { success: false, error: "Reddit login form interaction failed. (Timeout/Selector change)" };
         }
 
         // Step 4: Submit
