@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Plus, Trash2, ShieldAlert, Loader2, Play } from "lucide-react";
+import { Plus, Trash2, ShieldAlert, Loader2, Play, Eye, EyeOff } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 
@@ -23,6 +23,7 @@ export default function AccountsPage() {
     const [newPassword, setNewPassword] = useState("");
     const [warmingId, setWarmingId] = useState<string | null>(null);
     const [debugMode, setDebugMode] = useState(false);
+    const [showPassword, setShowPassword] = useState(false);
 
     // Live Session Modal
     const [liveAccount, setLiveAccount] = useState<any>(null);
@@ -201,14 +202,24 @@ export default function AccountsPage() {
                                     onChange={(e) => setNewUsername(e.target.value)}
                                     className="flex-1 bg-secondary border border-border rounded-xl px-4 py-3 text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary placeholder:text-muted-foreground"
                                 />
-                                <input
-                                    type="password"
-                                    required
-                                    placeholder="Password"
-                                    value={newPassword}
-                                    onChange={(e) => setNewPassword(e.target.value)}
-                                    className="flex-1 bg-secondary border border-border rounded-xl px-4 py-3 text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary placeholder:text-muted-foreground"
-                                />
+                                <div className="flex-1 relative group">
+                                    <input
+                                        type={showPassword ? "text" : "password"}
+                                        required
+                                        placeholder="Password"
+                                        value={newPassword}
+                                        onChange={(e) => setNewPassword(e.target.value)}
+                                        className="w-full bg-secondary border border-border rounded-xl px-4 py-3 text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary placeholder:text-muted-foreground pr-12"
+                                    />
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowPassword(!showPassword)}
+                                        className="absolute right-4 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-primary transition-colors focus:outline-none"
+                                        title={showPassword ? "Hide password" : "Show password"}
+                                    >
+                                        {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                                    </button>
+                                </div>
                                 <div className="flex items-center gap-2 px-4 py-3 bg-secondary border border-border rounded-xl">
                                     <input
                                         type="checkbox"
