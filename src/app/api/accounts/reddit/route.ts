@@ -4,7 +4,6 @@ import { prisma } from "@/lib/db";
 import { encrypt } from "@/lib/encryption";
 import { NextResponse } from "next/server";
 import { verifyRedditCredentials } from "@/lib/reddit-verify";
-import { fetchPublicRedditStats } from "@/lib/reddit-public";
 
 
 export async function GET() {
@@ -27,55 +26,12 @@ export async function GET() {
                 status: true,
                 karma: true,
                 accountAge: true,
-                updatedAt: true,
                 createdAt: true,
             },
         });
 
-        // --- LAZY SYNC: Refresh stale accounts via public Reddit API (no browser needed!) ---
-        const STALE_MS = 4 * 60 * 60 * 1000; // 4 hours
-        const staleAccounts = accounts.filter(acc =>
-            (Date.now() - new Date(acc.updatedAt).getTime()) > STALE_MS
-        );
-
-        if (staleAccounts.length > 0) {
-            console.log(`[LAZY SYNC] Refreshing ${staleAccounts.length} stale account(s) via public API...`);
-            // Fire-and-forget: Don't await, so API responds instantly
-            Promise.allSettled(
-                staleAccounts.map(async (acc) => {
-                    const stats = await fetchPublicRedditStats(acc.username);
-                    if (stats) {
-                        await prisma.redditAccount.update({
-                            where: { id: acc.id },
-                            data: {
-                                karma: stats.karma,
-                                accountAge: stats.ageDays,
-                                updatedAt: new Date(),
-                            }
-                        });
-                        console.log(`[LAZY SYNC] ✅ @${acc.username}: ${stats.karma} Karma, ${stats.ageDays} days old.`);
-                        // Override the account data in the response array too
-                        acc.karma = stats.karma;
-                        acc.accountAge = stats.ageDays;
-                    }
-                })
-            ).catch(err => console.error("[LAZY SYNC] Error:", err));
-        }
-
-        // Dynamic age fallback: accountAge + days since last update (for sub-day accuracy)
-        const accountsWithLiveAge = accounts.map(acc => {
-            const daysSinceUpdate = Math.floor(
-                (Date.now() - new Date(acc.updatedAt).getTime()) / (1000 * 60 * 60 * 24)
-            );
-            return {
-                ...acc,
-                accountAge: (acc.accountAge || 0) + daysSinceUpdate,
-            };
-        });
-
-        return NextResponse.json(accountsWithLiveAge);
+        return NextResponse.json(accounts);
     } catch (error) {
-        console.error("Fetch accounts error:", error);
         return NextResponse.json({ error: "Failed to fetch accounts" }, { status: 500 });
     }
 }

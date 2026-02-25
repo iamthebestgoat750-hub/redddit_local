@@ -607,67 +607,48 @@ export async function joinAndComment(page: Page, postUrl: string, commentText: s
  */
 export async function fetchRedditProfileStats(page: Page): Promise<{ karma: number; ageDays: number; status?: string } | null> {
     try {
-        // STEP 1: Get real username from API (most reliable, no redirect needed)
-        const meData = await page.evaluate(async () => {
-            try {
-                const res = await fetch('https://www.reddit.com/api/me.json', { credentials: 'include' });
-                if (res.ok) {
-                    const json = await res.json();
-                    return json.data;
-                }
-            } catch { }
-            return null;
-        });
+        addBrowserLog(page, 'Navigating to resolve username...');
+        await page.goto('https://www.reddit.com/user/me', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        const url = page.url();
+        const usernameMatch = url.match(/\/user\/([^/]+)/);
+        const username = usernameMatch ? usernameMatch[1] : null;
 
-        const username = meData?.name;
-
-        if (username) {
-            addBrowserLog(page, `Username from API: ${username}. Fetching stats...`);
+        if (username && !username.includes('me')) {
+            addBrowserLog(page, `Username resolved: ${username}. Fetching JSON...`);
             try {
-                const aboutData = await page.evaluate(async (uname: string) => {
+                const aboutJson = await page.evaluate(async (uname: string) => {
                     const res = await fetch(`https://www.reddit.com/user/${uname}/about.json`).catch(() => null);
                     if (!res || !res.ok) return null;
                     const json = await res.json();
                     return json.data;
                 }, username);
 
-                if (aboutData && aboutData.created_utc) {
-                    const exactDays = Math.floor((Date.now() - aboutData.created_utc * 1000) / (1000 * 60 * 60 * 24));
-                    const totalKarma = (aboutData.link_karma || 0) + (aboutData.comment_karma || 0);
-                    addBrowserLog(page, `✅ Stats: ${totalKarma} Karma, ${exactDays} Days old.`);
+                if (aboutJson && aboutJson.created_utc) {
+                    const createdTs = aboutJson.created_utc * 1000;
+                    const diff = Date.now() - createdTs;
+                    const exactDays = Math.floor(diff / (1000 * 60 * 60 * 24));
+                    const totalKarma = (aboutJson.link_karma || 0) + (aboutJson.comment_karma || 0);
+                    addBrowserLog(page, `✅ Stats: ${totalKarma} Karma, ${exactDays} Days.`);
                     return { karma: totalKarma, ageDays: exactDays, status: 'active' };
                 }
             } catch (jsonErr) {
-                addBrowserLog(page, `about.json fetch failed: ${(jsonErr as Error).message}`);
+                addBrowserLog(page, 'JSON fetch failed, using scraper fallback.');
             }
         }
 
-        // STEP 2: Fallback — navigate to /user/me and check redirect
-        addBrowserLog(page, 'Falling back to /user/me redirect...');
-        await page.goto('https://www.reddit.com/user/me', { waitUntil: 'domcontentloaded', timeout: 30000 });
-        const url = page.url();
-        const match = url.match(/\/user\/([^/]+)/);
-        const scrapedUser = match?.[1];
-
-        if (scrapedUser && scrapedUser !== 'me') {
-            const aboutJson = await page.evaluate(async (uname: string) => {
-                const res = await fetch(`https://www.reddit.com/user/${uname}/about.json`).catch(() => null);
-                if (!res || !res.ok) return null;
-                const json = await res.json();
-                return json.data;
-            }, scrapedUser);
-
-            if (aboutJson?.created_utc) {
-                const exactDays = Math.floor((Date.now() - aboutJson.created_utc * 1000) / (1000 * 60 * 60 * 24));
-                const totalKarma = (aboutJson.link_karma || 0) + (aboutJson.comment_karma || 0);
-                addBrowserLog(page, `✅ Fallback stats: ${totalKarma} Karma, ${exactDays} Days.`);
-                return { karma: totalKarma, ageDays: exactDays, status: 'active' };
-            }
+        addBrowserLog(page, 'Falling back to profile scraping...');
+        if (!page.url().includes('/user/')) {
+            await page.goto(`https://www.reddit.com/user/${username}/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
         }
 
-        addBrowserLog(page, 'Could not fetch stats. Returning defaults.');
-        return { karma: 0, ageDays: 0, status: 'active' };
+        const stats = await page.evaluate(() => {
+            const karmaEl = document.querySelector('[id*="karma"], [data-testid*="karma"]');
+            const karmaText = karmaEl ? karmaEl.textContent || '0' : '0';
+            const karma = parseInt(karmaText.replace(/[^0-9]/g, ''), 10) || 0;
+            return { karma, ageDays: 0, status: 'active' };
+        });
 
+        return stats;
     } catch (err) {
         addBrowserLog(page, `Profile stats error: ${(err as Error).message}`);
         return null;
