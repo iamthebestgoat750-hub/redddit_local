@@ -23,12 +23,27 @@ export async function verifyRedditCredentials(username: string, password: string
         console.log(`[DEBUG] Starting verification for ${username} (Headless: ${headless})`);
         step = "launch";
 
+        const proxyUrl = process.env.PROXY_URL;
+        let proxyConfig = undefined;
+
+        if (proxyUrl) {
+            try {
+                const url = new URL(proxyUrl);
+                proxyConfig = {
+                    server: `${url.protocol}//${url.host}`,
+                    username: url.username || undefined,
+                    password: url.password || undefined,
+                };
+                console.log(`[PROXY] Configured: ${proxyConfig.server} (Auth: ${!!proxyConfig.username})`);
+            } catch (e) {
+                console.error(`[PROXY] Invalid URL format: ${proxyUrl}`);
+            }
+        }
+
         context = await chromium.launchPersistentContext(sessionPath, {
             headless: headless,
             slowMo: 50,
-            proxy: process.env.PROXY_URL ? {
-                server: process.env.PROXY_URL,
-            } : undefined,
+            proxy: proxyConfig,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -43,6 +58,18 @@ export async function verifyRedditCredentials(username: string, password: string
         });
 
         const page = context.pages()[0] || await context.newPage();
+
+        // Detect and log current IP to verify proxy
+        try {
+            const ipData = await page.goto('https://api.ipify.org?format=json', { timeout: 15000 }).then(r => r?.json()).catch(() => null);
+            if (ipData && (ipData as any).ip) {
+                console.log(`[PROXY CHECK] Current Browser IP: ${(ipData as any).ip}`);
+            } else {
+                console.log('[PROXY CHECK] Could not detect IP via ipify.');
+            }
+        } catch (e) {
+            console.warn('[PROXY CHECK] IP detection failed (timeout or block).');
+        }
 
         async function verifySession(expectedUser: string): Promise<{ success: boolean; name?: string }> {
             try {
