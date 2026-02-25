@@ -25,6 +25,9 @@ export default function AccountsPage() {
     const [debugMode, setDebugMode] = useState(false);
     const [showPassword, setShowPassword] = useState(false);
     const [refreshingId, setRefreshingId] = useState<string | null>(null);
+    const [liveViewId, setLiveViewId] = useState<string | null>(null);
+    const [liveData, setLiveData] = useState<{ screenshot: string | null; logs: string[] }>({ screenshot: null, logs: [] });
+    const [isLiveLoading, setIsLiveLoading] = useState(false);
 
     // Fetch real accounts
     const fetchAccounts = async () => {
@@ -43,6 +46,25 @@ export default function AccountsPage() {
     useEffect(() => {
         fetchAccounts();
     }, []);
+
+    // Effect for live log polling
+    useEffect(() => {
+        if (!liveViewId) return;
+
+        const poll = async () => {
+            try {
+                const res = await fetch(`/api/accounts/reddit/${liveViewId}/live`);
+                if (res.ok) {
+                    const data = await res.json();
+                    setLiveData(data);
+                }
+            } catch (e) { }
+        };
+
+        poll();
+        const interval = setInterval(poll, 3000);
+        return () => clearInterval(interval);
+    }, [liveViewId]);
 
     const handleAdd = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -254,10 +276,29 @@ export default function AccountsPage() {
                                         <td className="p-4 text-foreground/80">{acc.accountAge}</td>
                                         <td className="p-4 text-right">
                                             <div className="flex items-center justify-end gap-2">
+                                                {(acc.status === 'warmup' || acc.status === 'warming' || acc.status === 'connecting') && (
+                                                    <button
+                                                        onClick={() => {
+                                                            setLiveViewId(acc.id);
+                                                            setLiveData({ screenshot: null, logs: [] });
+                                                        }}
+                                                        className="flex items-center gap-1.5 px-2 py-1 bg-primary/10 text-primary text-xs font-bold rounded-lg animate-pulse"
+                                                    >
+                                                        <span className="w-1.5 h-1.5 rounded-full bg-primary" /> LIVE
+                                                    </button>
+                                                )}
+                                                <button
+                                                    onClick={() => handleWarmup(acc.id)}
+                                                    disabled={warmingId === acc.id || isActionLoading}
+                                                    className="p-2 text-muted-foreground hover:text-yellow-500 hover:bg-yellow-500/10 rounded-lg transition-colors inline-flex disabled:opacity-50"
+                                                    title="Warmup Account"
+                                                >
+                                                    <RefreshCw className={`w-5 h-5 ${warmingId === acc.id ? 'animate-spin' : ''}`} />
+                                                </button>
                                                 <button
                                                     onClick={() => handleRefresh(acc.id)}
                                                     disabled={!!refreshingId || isActionLoading}
-                                                    className="p-2 text-muted-foreground hover:text-primary hover:bg-primary/10 rounded-lg transition-colors inline-flex disabled:opacity-50"
+                                                    className="p-2 text-muted-foreground hover:text-green-500 hover:bg-green-500/10 rounded-lg transition-colors inline-flex disabled:opacity-50"
                                                     title="Refresh Stats"
                                                 >
                                                     <RefreshCw className={`w-5 h-5 ${refreshingId === acc.id ? 'animate-spin' : ''}`} />
@@ -279,6 +320,84 @@ export default function AccountsPage() {
                     </table>
                 </div>
             </div>
+            {/* Live View Modal */}
+            <AnimatePresence>
+                {liveViewId && (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-background/80 backdrop-blur-sm">
+                        <motion.div
+                            initial={{ opacity: 0, scale: 0.95 }}
+                            animate={{ opacity: 1, scale: 1 }}
+                            exit={{ opacity: 0, scale: 0.95 }}
+                            className="glass-panel w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col shadow-2xl border-primary/20"
+                        >
+                            <div className="p-4 border-b border-border flex items-center justify-between bg-secondary/30">
+                                <div className="flex items-center gap-2">
+                                    <div className="w-2 h-2 rounded-full bg-primary animate-pulse" />
+                                    <h3 className="font-bold text-foreground">Live Browser Session: @{accounts.find(a => a.id === liveViewId)?.username}</h3>
+                                </div>
+                                <button
+                                    onClick={() => setLiveViewId(null)}
+                                    className="p-2 hover:bg-secondary rounded-lg transition-colors"
+                                >
+                                    <Plus className="w-5 h-5 rotate-45" />
+                                </button>
+                            </div>
+
+                            <div className="flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-2 gap-4 p-4">
+                                {/* Screenshot View */}
+                                <div className="bg-black rounded-xl border border-border overflow-hidden flex items-center justify-center aspect-video relative">
+                                    {liveData.screenshot ? (
+                                        <img
+                                            src={liveData.screenshot}
+                                            alt="Live Browser View"
+                                            className="w-full h-full object-contain"
+                                        />
+                                    ) : (
+                                        <div className="flex flex-col items-center gap-2 text-muted-foreground">
+                                            <Loader2 className="w-8 h-8 animate-spin" />
+                                            <span className="text-xs">Waiting for screenshot...</span>
+                                        </div>
+                                    )}
+                                    <div className="absolute top-2 right-2 px-2 py-1 bg-black/60 backdrop-blur-md rounded text-[10px] text-white/80 border border-white/10 uppercase font-bold tracking-widest">
+                                        Headless (Railway)
+                                    </div>
+                                </div>
+
+                                {/* Logs View */}
+                                <div className="flex flex-col bg-[#0d1117] rounded-xl border border-border overflow-hidden">
+                                    <div className="px-4 py-2 bg-white/5 border-b border-white/10 text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
+                                        Browser Console Logs
+                                    </div>
+                                    <div className="flex-1 p-4 font-mono text-xs overflow-y-auto space-y-1 custom-scrollbar">
+                                        {liveData.logs.length > 0 ? (
+                                            liveData.logs.map((log, i) => (
+                                                <div key={i} className="text-green-400/90 leading-relaxed break-words">
+                                                    <span className="text-muted-foreground/60 mr-2 opacity-50">{i + 1}</span>
+                                                    {log}
+                                                </div>
+                                            ))
+                                        ) : (
+                                            <div className="text-muted-foreground/40 italic">No logs available yet...</div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="p-4 bg-secondary/20 border-t border-border flex items-center justify-between gap-4">
+                                <p className="text-xs text-muted-foreground">
+                                    Auto-refreshing every 3s. Debug screenshots are ephemeral.
+                                </p>
+                                <button
+                                    onClick={() => setLiveViewId(null)}
+                                    className="px-4 py-2 rounded-lg bg-secondary hover:bg-border text-foreground text-sm font-medium transition-colors"
+                                >
+                                    Close Monitor
+                                </button>
+                            </div>
+                        </motion.div>
+                    </div>
+                )}
+            </AnimatePresence>
         </div>
     );
 }
