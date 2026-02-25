@@ -239,6 +239,81 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
 
         await checkStop();
 
+        // --- PROFILE SETUP: Check & fill bio if missing ---
+        async function setupProfileIfNeeded() {
+            try {
+                await addLog("🔍 Checking if profile has bio...");
+                // Reddit settings profile URL (try both)
+                await page.goto("https://www.reddit.com/settings/profile", { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await page.waitForTimeout(3000);
+
+                // Broader selector to catch different Reddit UI versions
+                const bioSelector = [
+                    'textarea[name="description"]',
+                    'textarea[id*="description"]',
+                    'textarea[placeholder*="bio"]',
+                    'textarea[placeholder*="about"]',
+                    'textarea[data-testid*="description"]',
+                    '#profile__description',
+                ].join(', ');
+
+                let bioFound = false;
+                try {
+                    await page.waitForSelector(bioSelector, { timeout: 10000 });
+                    bioFound = true;
+                } catch {
+                    // Try shreddit new settings
+                    await addLog("⚠️ Old bio selector not found, trying new Settings UI...");
+                    await page.goto("https://www.reddit.com/settings", { waitUntil: 'domcontentloaded', timeout: 20000 });
+                    await page.waitForTimeout(2000);
+                    try {
+                        await page.waitForSelector(bioSelector, { timeout: 8000 });
+                        bioFound = true;
+                    } catch { }
+                }
+
+                if (!bioFound) {
+                    await addLog("⚠️ Bio field not found on settings page. Skipping.");
+                    return;
+                }
+
+                const currentBio = await page.inputValue(bioSelector).catch(() => '');
+
+                if (!currentBio || currentBio.trim().length === 0) {
+                    await addLog("📝 Bio is empty! Generating a realistic bio with AI...");
+
+                    let bio = "Curious mind, lifelong learner. Love reading, technology, and connecting with people who share my interests.";
+                    try {
+                        const aiBio = await askGemini(
+                            `Write a very short, natural Reddit user bio (1-2 sentences, max 160 chars). Make it sound like a real everyday person — mention a hobby, interest, or personality trait. No marketing language, no hashtags, no emojis. Just plain text bio.`
+                        );
+                        if (aiBio && aiBio.trim().length > 10) {
+                            bio = aiBio.trim().replace(/^"|"$/g, '').slice(0, 160);
+                        }
+                    } catch { }
+
+                    await page.fill(bioSelector, bio);
+                    await page.waitForTimeout(1000 + Math.floor(Math.random() * 500));
+
+                    try {
+                        const saveBtn = page.locator('button[type="submit"]:has-text("Save"), button:has-text("Save Profile"), button:has-text("Save Changes")').first();
+                        await saveBtn.click();
+                        await page.waitForTimeout(2000);
+                        await addLog(`✅ Bio saved: "${bio.slice(0, 60)}..."`);
+                    } catch {
+                        await addLog("⚠️ Could not click Save button. Bio may not have saved.");
+                    }
+                } else {
+                    await addLog(`✅ Profile already has bio: "${currentBio.slice(0, 60)}..."`);
+                }
+            } catch (e: any) {
+                await addLog(`⚠️ Profile setup skipped: ${e.message.slice(0, 80)}`);
+            }
+        }
+
+        await setupProfileIfNeeded();
+        await checkStop();
+
         // 2. Generic Browsing (Scrolling on Home)
         addLog("Simulating home feed browsing...");
         await page.goto("https://www.reddit.com/", { waitUntil: 'domcontentloaded' });
@@ -458,13 +533,38 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
             }
         }
 
-        // 4. Update Database
-        await prisma.redditAccount.update({
-            where: { id: accountId },
-            data: { status: "active" } // Mark as active after warmup session
-        });
+        // 4. Refresh stats (karma + accountAge) from Reddit API
+        addLog("🔄 Refreshing account stats (karma & age)...");
+        try {
+            const { fetchRedditProfileStats } = require("./reddit-actions");
+            // Navigate to reddit home so cookies are active
+            await page.goto("https://www.reddit.com/", { waitUntil: 'domcontentloaded', timeout: 20000 });
+            const stats = await fetchRedditProfileStats(page);
+            if (stats) {
+                await prisma.redditAccount.update({
+                    where: { id: accountId },
+                    data: {
+                        status: "active",
+                        karma: stats.karma,
+                        accountAge: stats.ageDays,
+                    }
+                });
+                addLog(`✅ Stats updated — Karma: ${stats.karma}, Age: ${stats.ageDays} days.`);
+            } else {
+                await prisma.redditAccount.update({
+                    where: { id: accountId },
+                    data: { status: "active" }
+                });
+            }
+        } catch (statsErr: any) {
+            addLog(`⚠️ Stats refresh failed: ${statsErr.message}. Marking active anyway.`);
+            await prisma.redditAccount.update({
+                where: { id: accountId },
+                data: { status: "active" }
+            }).catch(() => { });
+        }
 
-        addLog("Warmup session completed successfully.");
+        addLog("✅ Warmup session completed successfully.");
         return { success: true, logs };
 
     } catch (error: any) {
