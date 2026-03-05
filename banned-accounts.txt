@@ -1,0 +1,46 @@
+============================================================
+REDDIT BANNED ACCOUNTS LOG
+============================================================
+
+USERNAME: MusicianWorldly9068
+BAN TYPE: Shadowban (Account-level)
+DATE: 2026-03-06
+KARMA AT BAN: 1
+ACCOUNT AGE AT BAN: ~3 days
+
+CAUSES / REASONS (Most Likely):
+------------------------------------------------------------
+
+1. TEST SCRIPTS WITH ACCOUNT COOKIES [HIGH RISK - Primary Cause]
+   - During debugging of the rules scraper, test scripts
+     (test-rules-api.ts, test-rules-final.ts, diagnose-rules.ts)
+     were run using the account's session cookies.
+   - These scripts made rapid, non-human browser requests
+     from the same session Reddit was tracking.
+   - Reddit's bot detection flagged this unusual activity.
+
+2. PROXY IP REPUTATION [MEDIUM RISK]
+   - HTTP proxy IP (161.77.143.192) is a shared datacenter IP.
+   - Reddit tracks known datacenter/VPN/proxy IPs.
+   - New accounts created or used from flagged IPs raise suspicion.
+
+3. COMMENTING TOO EARLY [MEDIUM RISK]
+   - Account was only 3 days old with 1 karma when Day 3
+     warmup started commenting.
+   - Reddit's spam filters are very aggressive on new, low-karma
+     accounts that start interacting quickly.
+
+4. RAPID SUBREDDIT VISITS [LOW RISK]
+   - Bot visited all 4 subreddits in one session.
+   - Multiple join requests in quick succession can look suspicious
+     even with delays.
+
+LESSONS LEARNED:
+------------------------------------------------------------
+- NEVER run test/diagnostic scripts using a real account's cookies.
+- Use a throwaway/dummy account for all testing.
+- Wait longer before commenting (Day 7+ not Day 3).
+- Consider residential proxies instead of datacenter proxies.
+- Day 1-7 should be BROWSE ONLY. No actions.
+
+============================================================

@@ -4,7 +4,8 @@ import { redis } from "./redis";
 import { chromium, BrowserContext } from "playwright";
 import { addBrowserLog, fetchRedditProfileStats } from "./reddit-actions";
 import { decrypt } from "./encryption";
-import { getTempSessionPath, saveCookiesToDb } from "./session-manager";
+import { getTempSessionPath, saveCookiesToDb, loadCookiesFromDb } from "./session-manager";
+import { getPlaywrightProxy } from "./proxy-config";
 
 export interface DiscoveredPost {
     redditId: string;
@@ -402,6 +403,7 @@ export async function discoverLeads(projectId: string, debugMode: boolean = fals
             context = await chromium.launchPersistentContext(sessionPath, {
                 headless: !debugMode,
                 slowMo: debugMode ? 50 : 0,
+                proxy: getPlaywrightProxy(),
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
@@ -415,7 +417,11 @@ export async function discoverLeads(projectId: string, debugMode: boolean = fals
                 viewport: { width: 1366, height: 768 }
             });
 
+
             const page = context.pages()[0] || await context.newPage();
+
+            // ✅ Restore cookies from DB first (survives restarts)
+            await loadCookiesFromDb(selectedAccount.id, context);
 
             async function verifySession(expectedUser: string): Promise<boolean> {
                 try {
@@ -443,6 +449,7 @@ export async function discoverLeads(projectId: string, debugMode: boolean = fals
                 await page.goto("https://www.reddit.com/", { waitUntil: 'domcontentloaded', timeout: 30000 });
             } catch (e) { /* timeout ok */ }
 
+
             const isDetected = await Promise.race([
                 page.waitForSelector('shreddit-async-loader[bundlename="user_menu"], #nav-user-menu, a[href*="/user/"]', { timeout: 12000 }).then(() => true),
                 page.waitForSelector('a[href*="/login"], button:has-text("Log In")', { timeout: 12000 }).then(() => false)
@@ -460,7 +467,7 @@ export async function discoverLeads(projectId: string, debugMode: boolean = fals
                     const userSelector = 'input[name="username"], #login-username, [name="username"]';
                     const passSelector = 'input[name="password"], #login-password, [name="password"]';
 
-                    await page.goto("https://www.reddit.com/login", { waitUntil: 'domcontentloaded' });
+                    await page.goto("https://old.reddit.com/login", { waitUntil: 'domcontentloaded' });
                     await page.waitForSelector(userSelector, { timeout: 15000 });
 
                     // Click + Type for custom elements (faceplate-text-input)
@@ -502,7 +509,7 @@ export async function discoverLeads(projectId: string, debugMode: boolean = fals
                         data: {
                             karma: stats.karma,
                             accountAge: stats.ageDays,
-                            status: stats.status || "active",
+                            // ❌ DO NOT update status here — preserves 'discovering' state
                             updatedAt: new Date()
                         }
                     });

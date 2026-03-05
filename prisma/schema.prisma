@@ -6,9 +6,10 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
   url      = env("DATABASE_URL")
 }
+
 
 
 model User {
@@ -182,6 +183,7 @@ model Subreddit {
   isFriendly  Boolean  @default(true) // AI score
   rules       String?
   lastScraped DateTime?
+  isJoined    Boolean  @default(false) // track if bot has already joined
 }
 
 model WarmupLog {

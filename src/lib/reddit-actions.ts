@@ -190,6 +190,103 @@ export async function upvotePost(page: Page): Promise<boolean> {
 
 
 /**
+ * Fetches subreddit rules from the sidebar widget using Shadow DOM piercing.
+ * Navigates to the normal subreddit page (not blocked) and reads the rules widget.
+ * Falls back to old Reddit HTML if shadow DOM is empty.
+ */
+/**
+ * Fetches subreddit rules from the sidebar widget using Shadow DOM piercing.
+ * Navigates to the normal subreddit page (not blocked) and reads the rules widget.
+ * Falls back to old Reddit HTML if shadow DOM is empty.
+ */
+export async function scrapeSubredditRules(page: Page, subreddit: string): Promise<string> {
+    const cleanSub = subreddit.startsWith('r/') ? subreddit : `r/${subreddit}`;
+    const subName = cleanSub.replace('r/', '');
+    addBrowserLog(page, `📋 Scraping rules for ${cleanSub}...`);
+
+    try {
+        // ── Strategy 1: Shadow DOM on subreddit page sidebar ──────────
+        if (!page.url().includes(subName)) {
+            await page.goto(`https://www.reddit.com/${cleanSub}/`, {
+                waitUntil: 'domcontentloaded',
+                timeout: 60000,
+            });
+            await page.waitForTimeout(4000); // Wait for shreddit-widgets to load
+        }
+
+        let rules: string[] = [];
+
+        try {
+            // Wait up to 5s for the rules widget to appear
+            const widget = page.locator('shreddit-community-rules-widget');
+            await widget.waitFor({ state: 'attached', timeout: 8000 });
+
+            // Using evaluate with a completely self-contained function to avoid __name errors
+            const extracted = await page.evaluate(() => {
+                const w = document.querySelector('shreddit-community-rules-widget');
+                if (!w) return null;
+                // Shadow root check
+                const shadow = (w as HTMLElement & { shadowRoot: ShadowRoot | null }).shadowRoot;
+                const source = shadow || w;
+                // Find all items that look like rules
+                const listItems = Array.from(source.querySelectorAll('li, [slot="title"], .rule-row'));
+                return listItems
+                    .map(item => (item.textContent || '').trim().replace(/\s+/g, ' '))
+                    .filter(t => t.length > 10 && !t.toLowerCase().includes('see full rules') && !/^[0-9]+$/.test(t));
+            });
+
+            if (extracted && extracted.length > 0) {
+                rules = extracted;
+            }
+        } catch {
+            // Widget not found in shadow DOM or timed out
+        }
+
+        if (rules.length > 0) {
+            const formatted = rules.map((r, i) => `${i + 1}. ${r}`).join('\n');
+            addBrowserLog(page, `✅ Found ${rules.length} rules for ${cleanSub}.`);
+            return formatted;
+        }
+
+        // ── Strategy 2: Old Reddit HTML ────────────────────────────────
+        addBrowserLog(page, `⚠️ Sidebar widget empty — trying old Reddit...`);
+        try {
+            await page.goto(`https://old.reddit.com/${cleanSub}/about/rules`, {
+                waitUntil: 'domcontentloaded',
+                timeout: 30000,
+            });
+            await page.waitForTimeout(2000);
+
+            const oldRules = await page.evaluate(() => {
+                const items = document.querySelectorAll('.rules-area .md p, .rules-area .md li, aside .rules li');
+                const results: string[] = [];
+                for (let i = 0; i < items.length; i++) {
+                    const text = (items[i].textContent || '').trim().replace(/\s+/g, ' ');
+                    if (text.length > 10 && !/^\/?r\/\w+/.test(text)) {
+                        results.push(text);
+                    }
+                }
+                return results;
+            });
+
+            if (oldRules.length > 0) {
+                const formatted = oldRules.map((r, i) => `${i + 1}. ${r}`).join('\n');
+                addBrowserLog(page, `✅ Found ${oldRules.length} rules for ${cleanSub} (old Reddit).`);
+                return formatted;
+            }
+        } catch (oldErr) {
+            addBrowserLog(page, `⚠️ Old Reddit fallback failed: ${(oldErr as Error).message}`);
+        }
+
+        addBrowserLog(page, `⚠️ No rules found for ${cleanSub} after all strategies.`);
+        return '(No explicit rules listed for this community)';
+    } catch (err) {
+        addBrowserLog(page, `⚠️ Could not scrape rules for ${cleanSub}: ${(err as Error).message}`);
+        return '(Rules unavailable)';
+    }
+}
+
+/**
  * Ensures the bot has joined a subreddit community.
  */
 export async function ensureJoinedCommunity(page: Page, subreddit: string): Promise<boolean> {
@@ -440,12 +537,12 @@ export async function joinAndComment(page: Page, postUrl: string, commentText: s
             await page.waitForTimeout(400);
         }
 
-        // Type character by character with human-like random delay (80-150ms)
+        // Type character by character with human-like random delay (150-400ms)
         for (const char of commentText) {
-            const delay = 80 + Math.floor(Math.random() * 70); // 80-150ms
+            const delay = 150 + Math.floor(Math.random() * 250); // 150-400ms
             await page.keyboard.type(char, { delay });
             // Occasional longer pause (simulates thinking)
-            if (Math.random() < 0.05) await page.waitForTimeout(300 + Math.floor(Math.random() * 400));
+            if (Math.random() < 0.08) await page.waitForTimeout(600 + Math.floor(Math.random() * 1000));
         }
 
         addBrowserLog(page, '✏️ Done typing. Verifying text in editor...');

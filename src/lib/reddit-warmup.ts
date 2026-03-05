@@ -3,12 +3,511 @@ import { prisma } from "@/lib/db";
 import { decrypt } from "@/lib/encryption";
 import { askGemini } from "@/lib/gemini";
 import { getTempSessionPath, saveCookiesToDb, loadCookiesFromDb } from "@/lib/session-manager";
+import { fetchRedditProfileStats, upvotePost, joinAndComment, ensureJoinedCommunity, scrapeSubredditRules } from "./reddit-actions";
+import { getPlaywrightProxy } from "./proxy-config";
 
 export interface WarmupResult {
     success: boolean;
     logs: string[];
     error?: string;
 }
+
+interface SessionPlan {
+    upvoteGoal: number;
+    commentGoal: number;
+    browseMinutes: number;
+    dayNumber: number;
+}
+
+// Warmup-safe subreddits — user-selected list
+const WARMUP_SUBREDDITS = [
+    "r/NewToReddit",
+    "r/NoStupidQuestions",
+    "r/Advice",
+    "r/AmazingStories",
+];
+
+// Subreddit tone guide for AI comments
+const SUBREDDIT_TONE_MAP: Record<string, string> = {
+    "NewToReddit": "Be warm, welcoming, and encouraging. The person is new — make them feel at home. Keep it friendly and simple.",
+    "NoStupidQuestions": "Be genuinely helpful, supportive, and direct. People here have real questions — give real, practical answers without being condescending.",
+    "Advice": "Be empathetic and practical. Offer a genuine perspective without being preachy. Be brief and human.",
+    "AmazingStories": "React with genuine amazement or curiosity. Share a brief thought on why the story is impressive or surprising.",
+};
+
+
+
+// ─────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────
+
+const randInt = (min: number, max: number) => min + Math.floor(Math.random() * (max - min + 1));
+
+/**
+ * Determine the warmup day number by counting distinct calendar days
+ * that already have WarmupLog entries for this account.
+ */
+async function getWarmupDayNumber(accountId: string): Promise<number> {
+    try {
+        const logs = await prisma.warmupLog.findMany({
+            where: { redditAccountId: accountId },
+            select: { performedAt: true },
+        });
+
+        if (logs.length === 0) return 1;
+
+        // Use LOCAL date (not UTC) so midnight in the user's timezone starts a new day
+        const toLocalDateStr = (d: Date) => {
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, "0");
+            const day = String(d.getDate()).padStart(2, "0");
+            return `${y}-${m}-${day}`;
+        };
+
+        const distinctDays = new Set(
+            logs.map((l) => toLocalDateStr(l.performedAt))
+        );
+
+        const todayStr = toLocalDateStr(new Date());
+
+        // If today already has logs it's the current day number,
+        // otherwise it's a new (incremented) day.
+        if (distinctDays.has(todayStr)) {
+            return distinctDays.size;
+        } else {
+            return distinctDays.size + 1;
+        }
+    } catch {
+        return 1;
+    }
+}
+
+/**
+ * Return randomised session targets based on which warmup day it is.
+ *
+ * Week 1
+ *   Day 1-2 : only browse + 0-1 upvote (NO comments)
+ *   Day 3-7 : 1-2 comments, 2-3 upvotes
+ * Week 2 (Day 8-14)  : 2-3 comments, 3-4 upvotes
+ * Week 3 (Day 15-21) : 4-5 comments, 4-5 upvotes
+ * Week 4+ (Day 22+)  : 5-6 comments, 5-6 upvotes
+ */
+function getSessionPlan(dayNumber: number): SessionPlan {
+    if (dayNumber <= 2) {
+        return {
+            upvoteGoal: randInt(0, 1),
+            commentGoal: 0,
+            browseMinutes: randInt(8, 13),
+            dayNumber,
+        };
+    }
+    if (dayNumber <= 7) {
+        return {
+            upvoteGoal: randInt(2, 3),
+            commentGoal: randInt(1, 2),
+            browseMinutes: randInt(6, 10),
+            dayNumber,
+        };
+    }
+    if (dayNumber <= 14) {
+        return {
+            upvoteGoal: randInt(3, 4),
+            commentGoal: randInt(2, 3),
+            browseMinutes: randInt(5, 9),
+            dayNumber,
+        };
+    }
+    if (dayNumber <= 21) {
+        return {
+            upvoteGoal: randInt(4, 5),
+            commentGoal: randInt(4, 5),
+            browseMinutes: randInt(5, 8),
+            dayNumber,
+        };
+    }
+    // Week 4+
+    return {
+        upvoteGoal: randInt(5, 6),
+        commentGoal: randInt(5, 6),
+        browseMinutes: randInt(4, 7),
+        dayNumber,
+    };
+}
+
+/**
+ * Mini-browse: scroll the current page for a short random duration.
+ * Simulates a human reading a page briefly.
+ */
+async function miniBrowse(
+    page: Page,
+    addLog: (msg: string) => void,
+    minSec = 20,
+    maxSec = 60
+): Promise<void> {
+    const seconds = randInt(minSec, maxSec);
+    const scrollCount = Math.max(3, Math.floor(seconds / 8) + randInt(0, 3));
+    addLog(`📖 Reading for ~${seconds}s...`);
+
+    for (let i = 0; i < scrollCount; i++) {
+        const scrollAmount = randInt(200, 600);
+        await page.mouse.wheel(0, scrollAmount);
+        await page.waitForTimeout(randInt(2000, 6000));
+
+        // Occasionally scroll back up a tiny bit (human behaviour)
+        if (Math.random() < 0.25) {
+            await page.mouse.wheel(0, -randInt(80, 200));
+            await page.waitForTimeout(randInt(600, 1500));
+        }
+    }
+}
+
+/**
+ * Extended browse session - visits the home feed then 2-3 random subreddits.
+ * Collects candidate post URLs from the visited subreddits for later engagement.
+ */
+async function extendedBrowse(
+    page: Page,
+    addLog: (msg: string) => void,
+    checkStop: () => Promise<void>,
+    subreddits: string[]
+): Promise<{ candidateUrls: string[]; visitedSubs: string[] }> {
+    const candidateUrls: string[] = [];
+    const visitedSubs: string[] = [];
+
+    // ── 1. Home feed — fully random duration (5 to 9 minutes) ─────
+    const homeFeedMin = randInt(300, 420); // 5 to 7 min
+    const homeFeedMax = randInt(440, 540); // 7.3 to 9 min
+    addLog("🏠 Browsing home feed...");
+    // Proxy can be slow — try with 60s timeout, retry once on failure
+    try {
+        await page.goto("https://www.reddit.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+    } catch {
+        addLog("⚠️ Home feed slow — retrying...");
+        try {
+            await page.goto("https://www.reddit.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+        } catch {
+            addLog("⚠️ Home feed load failed — skipping to subreddits...");
+        }
+    }
+    await page.waitForTimeout(randInt(1500, 4000));
+    await miniBrowse(page, addLog, homeFeedMin, homeFeedMax);
+    await checkStop();
+
+    // ── 2. Visit all subreddits (shuffled for randomness) ──────────
+    const shuffledSubs = [...subreddits].sort(() => Math.random() - 0.5);
+    const subsToVisit = shuffledSubs; // always visit all available subs
+
+    for (const sub of subsToVisit) {
+        await checkStop();
+        addLog(`📌 Visiting ${sub}...`);
+        try {
+            await page.goto(`https://www.reddit.com/${sub}/`, {
+                waitUntil: "domcontentloaded",
+                timeout: 30000,
+            });
+            await page.waitForTimeout(randInt(1500, 4000));
+            // Per-subreddit read time — main communities get more time
+            const isPrimary = sub.includes('NewToReddit') || sub.includes('NoStupidQuestions');
+            const subMin = isPrimary ? randInt(240, 360) : randInt(180, 240); // 4-6 min vs 3-4 min
+            const subMax = isPrimary ? randInt(370, 480) : randInt(250, 300); // up to 8 min vs 5 min
+            await miniBrowse(page, addLog, subMin, subMax);
+
+            // Collect post URLs from this subreddit
+            await page.waitForSelector("shreddit-post", { timeout: 10000 }).catch(() => { });
+            const postEls = page.locator("shreddit-post");
+            const cnt = await postEls.count();
+            for (let i = 0; i < Math.min(cnt, 8); i++) {
+                const href = await postEls.nth(i).getAttribute("permalink");
+                if (href) candidateUrls.push(`https://www.reddit.com${href}`);
+            }
+            visitedSubs.push(sub);
+
+            // ── RULES SCRAPING: First visit or stale rules ───────────
+            const subName = sub.replace('r/', '');
+            try {
+                const existing = await prisma.subreddit.findUnique({ where: { name: subName } });
+                const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+                if (!existing || !existing.rules || !existing.lastScraped || existing.lastScraped < sevenDaysAgo) {
+                    addLog(`📋 Scraping rules for ${sub}...`);
+                    const rules = await scrapeSubredditRules(page, sub);
+                    await prisma.subreddit.upsert({
+                        where: { name: subName },
+                        update: { rules, lastScraped: new Date() },
+                        create: { name: subName, rules, lastScraped: new Date() },
+                    });
+                    addLog(`✅ Rules saved for ${sub}.`);
+                    // Navigate back to the subreddit after scraping rules page
+                    await page.goto(`https://www.reddit.com/${sub}/`, {
+                        waitUntil: 'domcontentloaded',
+                        timeout: 30000,
+                    });
+                    await page.waitForTimeout(randInt(2000, 4000));
+                } else {
+                    addLog(`📋 Rules for ${sub} already cached — skipping scrape.`);
+                }
+            } catch (ruleErr) {
+                addLog(`⚠️ Rules scrape failed for ${sub}: ${(ruleErr as Error).message}`);
+            }
+
+            // ── JOIN LOGIC: Skip if already joined (DB records it) ───
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const subRecord = await (prisma.subreddit as any).findUnique({ where: { name: sub.replace('r/', '') } });
+            if (subRecord?.isJoined) {
+                addLog(`✅ Already joined ${sub} — skipping join check.`);
+            } else if (Math.random() < 0.6) {
+                const waitBeforeJoin = randInt(5000, 15000);
+                await page.waitForTimeout(waitBeforeJoin);
+                const joined = await ensureJoinedCommunity(page, sub);
+                if (joined) {
+                    // Save isJoined=true — run `npx prisma generate` to get full types
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    await (prisma.subreddit as any).upsert({
+                        where: { name: sub.replace('r/', '') },
+                        update: { isJoined: true },
+                        create: { name: sub.replace('r/', ''), isJoined: true },
+                    });
+                }
+                await page.waitForTimeout(randInt(10000, 25000));
+            } else {
+                addLog(`ℹ️ Decided not to join ${sub} this time (randomness).`);
+            }
+        } catch {
+
+            addLog(`⚠️ Could not visit ${sub}, skipping...`);
+        }
+
+        await checkStop();
+
+        // Rest between subreddits — 45 to 90 seconds
+        const gapSec = randInt(45, 90);
+        addLog(`⏳ Resting ${gapSec}s before next...`);
+        await page.waitForTimeout(gapSec * 1000);
+    }
+
+    addLog(`✅ Extended browse done. Collected ${candidateUrls.length} candidate posts.`);
+    return { candidateUrls, visitedSubs };
+}
+
+/**
+ * Generate an AI comment for a post; falls back to a curated human-sounding phrase.
+ */
+async function generateComment(
+    page: Page,
+    postUrl: string,
+    subredditName: string,
+    addLog: (msg: string) => void
+): Promise<string> {
+    let postTitle = "";
+    let postBody = "";
+
+    try {
+        postTitle = await page
+            .locator('h1, [slot="title"], shreddit-post [slot="title"]')
+            .first()
+            .innerText({ timeout: 3000 });
+    } catch {
+        postTitle = postUrl.split("/").slice(-2, -1)[0]?.replace(/_/g, " ") || "a Reddit post";
+    }
+    try {
+        postBody = await page
+            .locator('[slot="text-body"], [data-testid="post-content"], shreddit-post .md, .Post p')
+            .first()
+            .innerText({ timeout: 3000 });
+        if (postBody.length > 500) postBody = postBody.slice(0, 500) + "...";
+    } catch {
+        postBody = "";
+    }
+
+    const toneGuide =
+        SUBREDDIT_TONE_MAP[subredditName] ||
+        `Match the tone of r/${subredditName}. Be natural, contextual, and community-appropriate.`;
+    const postContext = postBody
+        ? `Title: "${postTitle}"\nContent: "${postBody}"`
+        : `Title: "${postTitle}"`;
+
+    // ── Fetch community rules from DB ─────────────────────────────
+    let communityRulesSection = '';
+    try {
+        const subRecord = await prisma.subreddit.findUnique({ where: { name: subredditName } });
+        if (subRecord?.rules && subRecord.rules !== '(Rules unavailable)' && subRecord.rules !== '(No explicit rules listed for this community)') {
+            communityRulesSection = `\n\n**⚠️ MANDATORY COMMUNITY RULES (YOU MUST FOLLOW THESE — VIOLATION = BAN):**\n${subRecord.rules}`;
+            addLog(`📋 Loaded ${subRecord.rules.split('\n').length} rules for r/${subredditName} into AI prompt.`);
+        }
+    } catch { }
+
+    try {
+        const aiReply = await askGemini(
+            `You are a real Reddit user who wants to write a comment that gets upvoted.
+
+**Subreddit:** r/${subredditName}
+**Subreddit Tone Guide:** ${toneGuide}${communityRulesSection}
+
+**Post Details:**
+${postContext}
+
+**Your task:**
+Write a single comment (1-3 sentences MAX) that:
+1. Is SPECIFIC to this post — reference an actual detail from the title or content
+2. Sounds like a real human, NOT a bot or marketer
+3. Matches the tone and culture of r/${subredditName} exactly
+4. Either shares a brief relatable experience or gives quick helpful insight
+5. Would realistically get 5–50 upvotes from this subreddit's community
+6. STRICTLY OBEYS all community rules listed above — if any rule says no AI content, your comment MUST sound entirely original and human
+
+**STRICT HUMAN-LIKE RULES:**
+- BE CASUAL: Use common Reddit contractions (don't, it's, etc.).
+- AVOID PERFECT CAPS: Occasionally start sentences with lowercase (e.g., "i think" instead of "I think").
+- BE BRIEF: Humans on Reddit are often blunt or short. Don't be overly helpful.
+- NO formal structure, NO corporate talk, NO hashtags/emojis.
+- Output ONLY the comment text.`
+        );
+        if (aiReply && aiReply.trim().length > 5) {
+            return aiReply.trim().replace(/^"|"$/g, "");
+        }
+    } catch (aiErr) {
+        addLog(`AI failed, using fallback: ${(aiErr as Error).message}`);
+    }
+
+    const fallbacks = [
+        "Honestly been wondering the same thing for a while — glad someone finally asked.",
+        "This is actually more common than people think. Happened to me too.",
+        "Good point, I hadn't thought about it from that angle before.",
+        "Yeah this community is surprisingly helpful, keep the questions coming.",
+        "Never thought about it this way but you're completely right.",
+        "This explains a lot actually, thanks for putting it into words.",
+    ];
+    return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+}
+
+/**
+ * Execute the warmup actions (upvotes + comments) in a fully randomised order.
+ *
+ * Each individual action is separated by a mini-browse gap.
+ * Actions are shuffled so comments and upvotes never happen in a fixed order.
+ * Even if the goal is 3 upvotes they are spread across the session individually.
+ */
+async function executeMixedSession(
+    page: Page,
+    plan: SessionPlan,
+    candidateUrls: string[],
+    visitedSubs: string[],
+    accountId: string,
+    addLog: (msg: string) => void,
+    checkStop: () => Promise<void>
+): Promise<void> {
+    type Task = { type: "upvote" | "comment"; url: string; sub: string };
+
+    if (candidateUrls.length === 0) {
+        addLog("⚠️ No candidate posts found. Skipping engagement.");
+        return;
+    }
+
+    // Build individual task objects (one per upvote, one per comment)
+    const tasks: Task[] = [];
+    const shuffledUrls = [...candidateUrls].sort(() => Math.random() - 0.5);
+
+    // Assign upvote tasks
+    const upvoteUrls = shuffledUrls.slice(0, Math.min(plan.upvoteGoal, shuffledUrls.length));
+    for (const url of upvoteUrls) {
+        const sub = visitedSubs[Math.floor(Math.random() * visitedSubs.length)] || "AskReddit";
+        tasks.push({ type: "upvote", url, sub });
+    }
+
+    // Assign comment tasks (use different URLs from upvote ones where possible)
+    const remainingUrls = shuffledUrls
+        .filter((u) => !upvoteUrls.includes(u))
+        .concat(shuffledUrls); // fallback if not enough unique
+    for (let i = 0; i < plan.commentGoal; i++) {
+        const url = remainingUrls[i % remainingUrls.length];
+        const sub = visitedSubs[Math.floor(Math.random() * visitedSubs.length)] || "AskReddit";
+        tasks.push({ type: "comment", url, sub });
+    }
+
+    // ── SHUFFLE ALL TASKS (this is the key — random mixed order) ──
+    tasks.sort(() => Math.random() - 0.5);
+
+    addLog(
+        `🎯 Session plan — Day ${plan.dayNumber}: ${plan.upvoteGoal} upvotes, ${plan.commentGoal} comments (mixed random order)`
+    );
+    addLog(`📋 Task queue: [${tasks.map((t) => t.type).join(" → ")}]`);
+
+    for (let i = 0; i < tasks.length; i++) {
+        const task = tasks[i];
+        await checkStop();
+
+        // ── Gap between tasks: mini browse ─────────────────────────
+        if (i > 0) {
+            const gapSec = randInt(30, 90);
+            addLog(`⏳ Gap between actions: ${gapSec}s of browsing...`);
+            await miniBrowse(page, addLog, gapSec - 10, gapSec + 10);
+            await checkStop();
+        }
+
+        // ── Navigate to the post ────────────────────────────────────
+        try {
+            addLog(`🔗 Navigating to post [${task.type}]...`);
+            await page.goto(task.url, { waitUntil: "domcontentloaded", timeout: 30000 });
+            await page.waitForTimeout(randInt(1500, 3000));
+
+            // Read the post for a bit (human behaviour)
+            await miniBrowse(page, addLog, 15, 40);
+            await checkStop();
+        } catch {
+            addLog(`⚠️ Navigation failed, skipping this task.`);
+            continue;
+        }
+
+        // ── Execute the task ────────────────────────────────────────
+        if (task.type === "upvote") {
+            const success = await upvotePost(page);
+            if (success) {
+                addLog(`⬆️ Upvoted post.`);
+                await prisma.warmupLog.create({
+                    data: {
+                        redditAccountId: accountId,
+                        action: "upvote",
+                        targetSubreddit: task.sub,
+                        targetPostId: task.url.split("/").slice(-2)[0] || "unknown",
+                    },
+                });
+            } else {
+                addLog(`❌ Upvote failed.`);
+            }
+        } else {
+            // Comment
+            const subredditName = task.sub.replace("r/", "");
+            const comment = await generateComment(page, task.url, subredditName, addLog);
+            addLog(`💬 Generated comment: "${comment.slice(0, 60)}..."`);
+
+            await checkStop();
+            const success = await joinAndComment(page, task.url, comment);
+            if (success) {
+                addLog(`✅ Comment posted!`);
+                await prisma.warmupLog.create({
+                    data: {
+                        redditAccountId: accountId,
+                        action: "comment",
+                        targetSubreddit: task.sub,
+                        targetPostId: task.url.split("/").slice(-2)[0] || "unknown",
+                    },
+                });
+            } else {
+                addLog(`❌ Comment failed.`);
+            }
+        }
+
+        // Short cooldown after each action
+        const cooldownSec = randInt(20, 55);
+        addLog(`💤 Cooling down ${cooldownSec}s after action...`);
+        await page.waitForTimeout(cooldownSec * 1000);
+    }
+
+    addLog("✅ All mixed session tasks done.");
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Main exported function
+// ─────────────────────────────────────────────────────────────────
 
 export async function warmupAccount(accountId: string, headless: boolean = true): Promise<WarmupResult> {
     const logs: string[] = [];
@@ -18,22 +517,21 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
         console.log(`[WARMUP][${timestamp}] ${msg}`);
         logs.push(fullMsg);
 
-        // Update live logs in DB for dashboard visibility
         try {
             await (prisma as any).redditAccount.update({
                 where: { id: accountId },
-                data: { lastDebugLogs: JSON.stringify(logs.slice(-50)) }
+                data: { lastDebugLogs: JSON.stringify(logs.slice(-50)) },
             });
         } catch (e) { }
     };
 
     const captureScreenshot = async (page: Page) => {
         try {
-            const screenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
-            const base64 = `data:image/jpeg;base64,${screenshot.toString('base64')}`;
+            const screenshot = await page.screenshot({ type: "jpeg", quality: 60 });
+            const base64 = `data:image/jpeg;base64,${screenshot.toString("base64")}`;
             await (prisma as any).redditAccount.update({
                 where: { id: accountId },
-                data: { lastDebugScreenshot: base64 }
+                data: { lastDebugScreenshot: base64 },
             });
         } catch (e) { }
     };
@@ -41,56 +539,69 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
     let context: BrowserContext | undefined;
 
     const checkStop = async () => {
-        const acc = await prisma.redditAccount.findUnique({ where: { id: accountId }, select: { status: true } });
-        if (acc?.status !== 'warmup' && acc?.status !== 'warming') {
+        const acc = await prisma.redditAccount.findUnique({
+            where: { id: accountId },
+            select: { status: true },
+        });
+        if (acc?.status !== "warmup" && acc?.status !== "warming") {
             addLog("⏹️ Stop signal detected. Terminating session...");
             throw new Error("STOP_SIGNAL");
         }
     };
 
     try {
-        const account = await prisma.redditAccount.findUnique({
-            where: { id: accountId }
-        });
-
+        const account = await prisma.redditAccount.findUnique({ where: { id: accountId } });
         if (!account) throw new Error("Account not found");
 
-        // Get temp session path (handles OS differences + lock file cleanup)
         const sessionPath = getTempSessionPath(account.username);
 
-        // Update status to 'warmup' immediately
         await prisma.redditAccount.update({
             where: { id: accountId },
-            data: { status: "warmup" }
+            data: { status: "warmup" },
         });
 
         const password = decrypt(account.password);
         await addLog(`Starting warmup for @${account.username}...`);
 
+        // ── Determine warmup day before launching browser ──────────
+        const dayNumber = await getWarmupDayNumber(accountId);
+        const plan = getSessionPlan(dayNumber);
+        await addLog(
+            `📅 Warmup Day ${dayNumber} — Plan: ${plan.upvoteGoal} upvotes | ${plan.commentGoal} comments | ~20-40 min browse (6-9 subreddits)`
+        );
+
+        // ── Show active IP before browser launch ───────────────────
+        try {
+            const proxyConf = getPlaywrightProxy();
+            if (proxyConf) {
+                await addLog(`🛡️ Proxy active → Reddit will see IP: 161.77.143.192`);
+            } else {
+                await addLog(`⚠️ No proxy set — using your real IP!`);
+            }
+        } catch { }
+
+        // ── Launch browser ─────────────────────────────────────────
         context = await chromium.launchPersistentContext(sessionPath, {
             headless: headless,
             slowMo: 100,
-            proxy: process.env.PROXY_URL ? {
-                server: process.env.PROXY_URL,
-            } : undefined,
+            proxy: getPlaywrightProxy(),
             args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage',
-                '--no-first-run',
-                '--no-default-browser-check',
-                '--disable-extensions'
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-extensions",
             ],
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            viewport: { width: 1366, height: 768 }
+            userAgent:
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            viewport: { width: 1366, height: 768 },
         });
 
-        const page = context.pages()[0] || await context.newPage();
+        const page = context.pages()[0] || (await context.newPage());
 
-        // ✅ CRITICAL: Load cookies from DB into browser BEFORE any navigation
-        // This means if we saved cookies during account add (API login) or a previous warmup,
-        // the browser is already logged in — no fresh login, no CAPTCHA!
+        // ── Restore cookies / login ─────────────────────────────────
         const cookiesLoaded = await loadCookiesFromDb(accountId, context);
         if (cookiesLoaded) {
             addLog("✅ Restored session from database — skipping login!");
@@ -98,56 +609,40 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
             addLog("No saved cookies found. Will attempt browser login...");
         }
 
-        // ENHANCED STEALTH: Mock more browser properties
         await page.addInitScript(() => {
-            // Hide webdriver
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-            // Mock Chrome runtime
+            Object.defineProperty(navigator, "webdriver", { get: () => undefined });
             (window as any).chrome = { runtime: {} };
-
-            // Mock permissions
             const originalQuery = window.navigator.permissions.query;
             (window.navigator.permissions as any).query = (parameters: any) =>
-                parameters.name === 'notifications'
+                parameters.name === "notifications"
                     ? Promise.resolve({ state: Notification.permission })
                     : originalQuery(parameters);
-
-            // Mock plugins
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-
-            // Mock languages
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
         });
 
-        // 1. Session Check / Login
+        // ── Session verification ────────────────────────────────────
         async function verifySession(expectedUser: string): Promise<boolean> {
             try {
-                // Wait for any potential redirects to finish
                 await page.waitForTimeout(2000);
                 const apiData = await page.evaluate(async () => {
                     try {
-                        const res = await fetch('https://www.reddit.com/api/me.json', { credentials: 'include' });
-                        if (res.ok) {
-                            const json = await res.json();
-                            return json.data;
-                        }
+                        const res = await fetch("https://www.reddit.com/api/me.json", {
+                            credentials: "include",
+                        });
+                        if (res.ok) return (await res.json()).data;
                     } catch { }
                     return null;
                 });
-
-                if (apiData && apiData.name) {
+                if (apiData?.name) {
                     const actualName = apiData.name.toLowerCase();
                     const expected = expectedUser.toLowerCase();
-
-                    // Allow match if names are equal OR if expected is an email (since API returns username)
-                    if (actualName === expected || expectedUser.includes('@')) {
+                    if (actualName === expected || expectedUser.includes("@")) {
                         addLog(`✅ Session verified: Logged in as @${apiData.name}`);
                         return true;
-                    } else {
-                        addLog(`⚠️ Session mismatch: Logged in as @${apiData.name}, but expected @${expectedUser}`);
-                        return false;
                     }
+                    addLog(`⚠️ Session mismatch: @${apiData.name} vs expected @${expectedUser}`);
+                    return false;
                 }
             } catch { }
             return false;
@@ -155,328 +650,157 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
 
         addLog("Checking if already logged in...");
         try {
-            await page.goto("https://www.reddit.com/", { waitUntil: 'domcontentloaded', timeout: 30000 });
-        } catch (e) {
-            addLog("Initial page load timed out, retrying with basic check...");
+            await page.goto("https://www.reddit.com/", { waitUntil: "domcontentloaded", timeout: 30000 });
+        } catch {
+            addLog("Initial page load timed out, retrying...");
         }
 
-        // Wait up to 15s for either login button OR user menu to appear
         const isDetected = await Promise.race([
-            page.waitForSelector('shreddit-async-loader[bundlename="user_menu"], #nav-user-menu, a[href*="/user/"], [aria-label*="User menu"]', { timeout: 15000 }).then(() => true),
-            page.waitForSelector('a[href*="/login"], button:has-text("Log In"), #login-link', { timeout: 15000 }).then(() => false)
+            page.waitForSelector(
+                'shreddit-async-loader[bundlename="user_menu"], #nav-user-menu, a[href*="/user/"], [aria-label*="User menu"]',
+                { timeout: 15000 }
+            ).then(() => true),
+            page.waitForSelector('a[href*="/login"], button:has-text("Log In"), #login-link', {
+                timeout: 15000,
+            }).then(() => false),
         ]).catch(() => false);
 
         let isLoggedIn = false;
-        if (isDetected) {
-            isLoggedIn = await verifySession(account.username);
-        }
+        if (isDetected) isLoggedIn = await verifySession(account.username);
 
         if (!isLoggedIn) {
-            await addLog("No valid session. Going to reddit.com to click Log In...");
-
-            // Step 1: Go to reddit.com homepage
-            await page.goto("https://www.reddit.com/", { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await addLog("No valid session. Logging in...");
+            await page.goto("https://www.reddit.com/", { waitUntil: "domcontentloaded", timeout: 30000 });
             await captureScreenshot(page);
-            await addLog("📸 Step 1: Opened reddit.com homepage");
 
-            // Step 2: Click the Log In button on the navbar
             try {
                 const loginBtn = await page.waitForSelector(
                     'a[href*="/login"], a:has-text("Log In"), button:has-text("Log In"), #login-link',
                     { timeout: 10000 }
                 );
                 await loginBtn!.click();
-                await addLog("📸 Step 2: Clicked Log In button on homepage");
-                // Wait for login page to fully load
                 await page.waitForURL(/login/, { timeout: 15000 }).catch(() => { });
             } catch {
-                // Fallback: go directly to /login if button not found
-                await addLog("Login button not found, navigating directly to /login...");
-                await page.goto("https://www.reddit.com/login", { waitUntil: 'domcontentloaded', timeout: 30000 });
+                // Fallback: go directly to old.reddit.com/login (simpler UI, less bot detection)
+                await page.goto("https://old.reddit.com/login", {
+                    waitUntil: "domcontentloaded",
+                    timeout: 30000,
+                });
             }
 
-            await captureScreenshot(page);
-            await addLog("📸 Step 3: Login page loaded - filling credentials");
 
+            await captureScreenshot(page);
             const userSelector = 'input[name="username"], #login-username, [name="username"]';
             const passSelector = 'input[name="password"], #login-password, [name="password"]';
-
             await page.waitForSelector(userSelector, { timeout: 15000 });
-
             await page.click(userSelector);
-            await page.keyboard.type(account.username, { delay: 100 });
-
+            await page.keyboard.type(account.username, { delay: randInt(200, 500) });
             await page.click(passSelector);
-            await page.keyboard.type(password, { delay: 100 });
-
-            await captureScreenshot(page);
-            await addLog("📸 Step 4: Credentials filled - clicking submit");
+            await page.keyboard.type(password, { delay: randInt(200, 500) });
 
             await page.click('button[type="submit"], button:has-text("Log In")');
-
-            // Wait for landing on home
-            await page.waitForURL((url) => url.toString().includes("reddit.com") && !url.toString().includes("login"), { timeout: 90000 });
+            await page.waitForURL(
+                (url) => url.toString().includes("reddit.com") && !url.toString().includes("login"),
+                { timeout: 90000 }
+            );
             await captureScreenshot(page);
-            await addLog("📸 Step 5: Login successful! Now on reddit.com");
-
-            // Wait a few seconds to ensure cookies are ready
-            await addLog("Saving session to DB...");
+            await addLog("Login successful!");
             await page.waitForTimeout(3000);
-
-            // ✅ Save cookies to database
             await saveCookiesToDb(accountId, context!);
 
-            // Final Verification
             const verified = await verifySession(account.username);
-            await captureScreenshot(page);
-            if (!verified) {
-                throw new Error("Login verification failed. Account might be locked or credentials incorrect.");
-            }
-            await addLog("✅ Login verified and session saved successfully!");
+            if (!verified) throw new Error("Login verification failed.");
+            await addLog("✅ Login verified and session saved!");
         } else {
-            await addLog("✅ Active session detected - no login needed.");
+            await addLog("✅ Active session detected — no login needed.");
         }
 
-        await checkStop();
-
-        // 2. Generic Browsing (Scrolling on Home)
-        addLog("Simulating home feed browsing...");
-        await page.goto("https://www.reddit.com/", { waitUntil: 'domcontentloaded' });
-
-        await prisma.warmupLog.create({
-            data: { redditAccountId: accountId, action: "browse", targetSubreddit: "home" }
-        });
-
-        for (let i = 0; i < 3; i++) {
-            await checkStop();
-            const scrollAmount = Math.floor(Math.random() * 600) + 400;
-            await page.mouse.wheel(0, scrollAmount);
-            await captureScreenshot(page);
-            await addLog(`Scrolled ${scrollAmount}px and browsing...`);
-            await page.waitForTimeout(Math.random() * 2000 + 1500);
-        }
-
-        // 3. Dynamic Subreddit Warmup (Randomly choose from 3 vetted communities)
-        const warmupSubreddits = [
-            "r/NoStupidQuestions",
-            "r/AskReddit",
-            "r/NewToReddit"
-        ];
-        const targetSubreddit = warmupSubreddits[Math.floor(Math.random() * warmupSubreddits.length)];
-
-        addLog(`Selected warmup community: ${targetSubreddit}`);
-        addLog(`Navigating to ${targetSubreddit} community...`);
-
-        // Retry navigation up to 2 times with increased timeout
-        let navSuccess = false;
-        for (let attempt = 0; attempt < 2; attempt++) {
-            try {
-                await page.goto(`https://www.reddit.com/${targetSubreddit}/new/`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                navSuccess = true;
-                break;
-            } catch (e) {
-                addLog(`Navigation attempt ${attempt + 1} timed out. Retrying...`);
-            }
-        }
-        if (!navSuccess) {
-            addLog(`❌ Could not navigate to ${targetSubreddit} after 2 attempts.`);
-            await prisma.redditAccount.update({ where: { id: accountId }, data: { status: "active" } });
-            return { success: false, logs, error: "Navigation timeout" };
-        }
-
-        await checkStop();
-
-        await prisma.warmupLog.create({
-            data: { redditAccountId: accountId, action: "browse", targetSubreddit: targetSubreddit }
-        });
-
-        // Subreddit Scrolling
-        addLog(`Browsing ${targetSubreddit} feed to build trust...`);
-        for (let i = 0; i < 3; i++) {
-            await checkStop();
-            await page.mouse.wheel(0, 500);
-            await page.waitForTimeout(2000);
-        }
-
-        // Find posts to engage with
-        addLog("Finding posts to engage with...");
+        // ── Refresh stats ───────────────────────────────────────────
         try {
-            await page.waitForSelector('shreddit-post', { timeout: 15000 });
-        } catch (e) {
-            addLog(`No posts appeared within 15s on ${targetSubreddit}.`);
+            await addLog("📊 Refreshing account stats...");
+            const stats = await fetchRedditProfileStats(page);
+            if (stats) {
+                await prisma.redditAccount.update({
+                    where: { id: accountId },
+                    data: { karma: stats.karma, accountAge: stats.ageDays, updatedAt: new Date() },
+                });
+                await addLog(`✅ Stats: ${stats.karma} Karma, ${stats.ageDays} Days.`);
+            }
+        } catch (err: any) {
+            await addLog(`⚠️ Could not update stats: ${err.message}`);
         }
 
-        const postElements = page.locator('shreddit-post');
-        const count = await postElements.count();
-        addLog(`Found ${count} posts on page. Collecting candidates...`);
-
-        const candidateUrls: string[] = [];
-        for (let i = 0; i < Math.min(count, 10); i++) {
-            const url = await postElements.nth(i).getAttribute('permalink');
-            if (url) candidateUrls.push(`https://www.reddit.com${url}`);
-        }
-
-        // --- STEP 3A: COMMUNITY VERIFICATION & UPVOTING ---
-        const { upvotePost, joinAndComment, ensureJoinedCommunity } = require("./reddit-actions");
-
-        // Verify and join community if needed
-        await ensureJoinedCommunity(page, targetSubreddit);
         await checkStop();
 
-        const upvoteCount = Math.min(Math.floor(Math.random() * 2) + 2, candidateUrls.length);
-        const shuffled = [...candidateUrls].sort(() => Math.random() - 0.5);
-        const postsToUpvote = shuffled.slice(0, upvoteCount);
+        // ── Extended browsing ───────────────────────────────────────
+        await addLog("🌐 Starting extended browsing session...");
+        await prisma.warmupLog.create({
+            data: { redditAccountId: accountId, action: "browse", targetSubreddit: "home" },
+        });
 
-        addLog(`Upvoting ${upvoteCount} posts in ${targetSubreddit} to build engagement...`);
-        for (const upvoteUrl of postsToUpvote) {
-            try {
-                await page.goto(upvoteUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-                await page.waitForTimeout(1500);
+        const { candidateUrls, visitedSubs } = await extendedBrowse(
+            page,
+            addLog,
+            checkStop,
+            WARMUP_SUBREDDITS
+        );
 
-                // Scroll to read the post a bit
-                await page.mouse.wheel(0, Math.floor(Math.random() * 300) + 200);
-                await page.waitForTimeout(Math.floor(Math.random() * 2000) + 1500);
+        await checkStop();
 
-                await checkStop();
-                const success = await upvotePost(page);
-                if (success) {
-                    addLog(`⬆️ Upvoted: ${upvoteUrl.split('/').pop()}`);
-                    await prisma.warmupLog.create({
-                        data: { redditAccountId: accountId, action: "upvote", targetSubreddit: targetSubreddit, targetPostId: upvoteUrl.split('/').pop() || "unknown" }
-                    });
-                }
+        await checkStop();
 
-                await page.waitForTimeout(Math.floor(Math.random() * 1500) + 1000);
-            } catch (err: any) {
-                if (err.message === "STOP_SIGNAL") throw err;
-                addLog(`Upvote failed: ${(err as Error).message}`);
+        // ── Mixed engagement session ────────────────────────────────
+
+        // Only do engagement if there's anything to do
+        if (plan.upvoteGoal > 0 || plan.commentGoal > 0) {
+            // Skip comments for very new accounts (< 1 day)
+            const accountAgeDays = account.accountAge || 0;
+            if (accountAgeDays < 1 && plan.commentGoal > 0) {
+                await addLog(
+                    `⚠️ Account only ${accountAgeDays} day(s) old. Skipping comments — browse + upvote only.`
+                );
+                plan.commentGoal = 0;
             }
-        }
 
-        // --- SAFE AGE CHECK: Skip comments for very new accounts ---
-        const accountAgeDays = account.accountAge || 0;
-        const MIN_AGE_FOR_COMMENTING = 1; // days — accounts < 1 day old: browse + upvote only
-
-        if (accountAgeDays < MIN_AGE_FOR_COMMENTING) {
-            addLog(`⚠️ Account is only ${accountAgeDays} day(s) old. Skipping comments to avoid shadow ban.`);
-            addLog(`✅ Safe warmup complete: browsing + upvoting only. Comments unlock after 1 day.`);
+            await executeMixedSession(
+                page,
+                plan,
+                candidateUrls,
+                visitedSubs.length > 0 ? visitedSubs : ["r/AskReddit"],
+                accountId,
+                addLog,
+                checkStop
+            );
         } else {
-            // Go back to subreddit for commenting
-            addLog(`Returning to ${targetSubreddit} for commenting...`);
-            await page.goto(`https://www.reddit.com/${targetSubreddit}/new/`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            await page.waitForTimeout(2000);
-
-            // Re-collect post URLs
-            const freshPostElements = page.locator('shreddit-post');
-            const freshCount = await freshPostElements.count();
-            const freshCandidateUrls: string[] = [];
-            for (let i = 0; i < Math.min(freshCount, 10); i++) {
-                const url = await freshPostElements.nth(i).getAttribute('permalink');
-                if (url) freshCandidateUrls.push(`https://www.reddit.com${url}`);
-            }
-            const commentCandidates = freshCandidateUrls.filter(u => !postsToUpvote.includes(u));
-            const finalCandidates = commentCandidates.length > 0 ? commentCandidates : freshCandidateUrls;
-
-            // --- STEP 3B: COMMENT ON 1 POST ---
-            let commentSuccess = false;
-            for (let i = 0; i < Math.min(finalCandidates.length, 5); i++) {
-                if (commentSuccess) break;
-
-                const postUrl = finalCandidates[i];
-                addLog(`[Comment Attempt ${i + 1}/5] Opening post: ${postUrl}`);
-
-                // Navigate to the post first to read its content
-                await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-                await page.waitForTimeout(2000);
-                await checkStop();
-
-                // NOW read the title + body from the actual post page
-                let postTitle = "";
-                let postBody = "";
-                try {
-                    postTitle = await page.locator('h1, [slot="title"], shreddit-post [slot="title"]').first().innerText({ timeout: 3000 });
-                } catch {
-                    postTitle = postUrl.split('/').slice(-2, -1)[0]?.replace(/_/g, ' ') || "a Reddit post";
-                }
-                try {
-                    postBody = await page.locator('[slot="text-body"], [data-testid="post-content"], shreddit-post .md, .Post p').first().innerText({ timeout: 3000 });
-                    if (postBody.length > 500) postBody = postBody.slice(0, 500) + "...";
-                } catch {
-                    postBody = "";
-                }
-
-                addLog(`Post: "${postTitle.slice(0, 60)}..."`);
-                const postContext = postBody ? `Title: "${postTitle}"\nContent: "${postBody}"` : `Title: "${postTitle}"`;
-
-                // Generate AI comment via Gemini
-                let comment = "Great post! Thanks for sharing.";
-                try {
-                    const aiReply = await askGemini(
-                        `You are a helpful Reddit user. Write a short, natural comment (1-2 sentences max) in response to this Reddit post:\n\n${postContext}\n\nBe genuine, friendly, and relevant. Do NOT use hashtags, emojis, or marketing language. Just the comment text.`
-                    );
-                    if (aiReply && aiReply.trim().length > 5) {
-                        comment = aiReply.trim().replace(/^"|"$/g, '');
-                    }
-                } catch (aiErr) {
-                    const fallbacks = [
-                        "This community is so welcoming! Happy to be here.",
-                        "I'm new to Reddit and finding these tips very helpful. Thanks!",
-                        "Thanks for sharing this, exactly what a newcomer needs to know.",
-                        "Great post! Love how supportive everyone is here."
-                    ];
-                    comment = fallbacks[Math.floor(Math.random() * fallbacks.length)];
-                    addLog(`AI failed, using fallback: ${(aiErr as Error).message}`);
-                }
-
-                addLog(`Generated comment: "${comment.slice(0, 60)}..."`);
-
-                // Call joinAndComment (it will navigate to the URL again, which is fine)
-                await checkStop();
-                const success = await joinAndComment(page, postUrl, comment);
-
-                if (success) {
-                    addLog(`✅ Successfully posted comment!`);
-                    await prisma.warmupLog.create({
-                        data: {
-                            redditAccountId: accountId,
-                            action: "comment",
-                            targetSubreddit: targetSubreddit,
-                            targetPostId: postUrl.split('/').pop() || "unknown"
-                        }
-                    });
-                    commentSuccess = true;
-                } else {
-                    addLog(`Attempt ${i + 1} failed. Moving to next...`);
-                }
-
-                await page.waitForTimeout(2000);
-            }
-
-            if (!commentSuccess) {
-                addLog("Could not comment on any of the attempted posts (all locked or failed).");
-                await page.screenshot({ path: `error-comment-all-failed-${Date.now()}.png` });
-            }
+            await addLog("📅 Day 1-2 plan: browse-only session. No engagement today.");
         }
 
-        // 4. Update Database
+        // ── Final stats refresh ─────────────────────────────────────
+        await addLog("📊 Final stats refresh...");
+        const finalStats = await fetchRedditProfileStats(page).catch(() => null);
+
         await prisma.redditAccount.update({
             where: { id: accountId },
-            data: { status: "active" } // Mark as active after warmup session
+            data: {
+                status: "active",
+                karma: finalStats?.karma ?? undefined,
+                accountAge: finalStats?.ageDays ?? undefined,
+                updatedAt: new Date(),
+            },
         });
 
-        addLog("Warmup session completed successfully.");
+        await addLog(`🎉 Warmup Day ${dayNumber} complete!`);
         return { success: true, logs };
 
     } catch (error: any) {
         if (error.message === "STOP_SIGNAL") {
-            addLog("⏹️ Session stopped successfully.");
+            addLog("⏹️ Session stopped by user.");
             return { success: true, logs, error: "Stopped by user" };
         }
         addLog(`FATAL ERROR: ${error.message}`);
-        // Reset status to active so user can try again
         await prisma.redditAccount.update({
             where: { id: accountId },
-            data: { status: "active" }
+            data: { status: "active" },
         }).catch(() => { });
         return { success: false, logs, error: error.message };
     } finally {

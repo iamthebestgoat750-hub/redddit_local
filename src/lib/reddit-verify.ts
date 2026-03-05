@@ -2,6 +2,7 @@ import { chromium, BrowserContext, Page, Cookie } from "playwright";
 import { fetchRedditProfileStats } from "./reddit-actions";
 import { getTempSessionPath } from "./session-manager";
 import { prisma } from "@/lib/db";
+import { getPlaywrightProxy } from "./proxy-config";
 
 export interface VerificationResult {
     success: boolean;
@@ -96,7 +97,7 @@ export async function verifyRedditCredentials(username: string, password: string
         context = await chromium.launchPersistentContext(sessionPath, {
             headless: headless,
             slowMo: 0,
-            proxy: process.env.PROXY_URL ? { server: process.env.PROXY_URL } : undefined,
+            proxy: getPlaywrightProxy(),
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -232,15 +233,36 @@ export async function verifyRedditCredentials(username: string, password: string
             }
         }
 
-        // Step 2: Go directly to old.reddit.com/login (no network security block)
+        // Step 2: Stay on www.reddit.com and click the Login button
+        // (Direct navigation to login URLs is blocked by some proxies)
         step = "navigate";
-        console.log(`[DEBUG] Navigating to old.reddit.com/login...`);
-        if (accountId) await saveLogToDb(accountId, "🔐 Step 2: Going to old.reddit.com/login (bypass security)...");
+        console.log(`[DEBUG] Looking for Login button on reddit.com...`);
+        if (accountId) await saveLogToDb(accountId, "🔐 Step 2: Looking for Login button on reddit.com...");
 
         try {
-            await page.goto("https://old.reddit.com/login", { waitUntil: 'domcontentloaded', timeout: 30000 });
-        } catch (e: any) {
-            return { success: false, error: `Could not reach Reddit login page.` };
+            // Make sure we are on reddit.com (already should be from Step 1)
+            const currentUrl = page.url();
+            if (!currentUrl.includes('reddit.com')) {
+                await page.goto("https://www.reddit.com/", { waitUntil: 'domcontentloaded', timeout: 30000 });
+            }
+
+            // Click the Login button on the homepage
+            const loginBtn = await page.waitForSelector(
+                'a[href*="/login"], a:has-text("Log In"), button:has-text("Log In"), #login-button, [data-testid="login-button"]',
+                { timeout: 15000 }
+            );
+            if (loginBtn) {
+                await loginBtn.click();
+                await page.waitForTimeout(3000);
+                console.log(`[DEBUG] Clicked login button, current URL: ${page.url()}`);
+            }
+        } catch {
+            // If no button found, try navigating to login (last resort)
+            try {
+                await page.goto("https://www.reddit.com/login", { waitUntil: 'domcontentloaded', timeout: 45000 });
+            } catch (e: any) {
+                return { success: false, error: `Could not reach Reddit login page.` };
+            }
         }
 
         await humanDelay(800, 1500);
@@ -249,6 +271,7 @@ export async function verifyRedditCredentials(username: string, password: string
             await saveScreenshotToDb(accountId, page);
             await saveLogToDb(accountId, "📸 Step 2: Login page loaded - filling credentials...");
         }
+
 
         // Step 3: Fill credentials on old.reddit.com  
         step = "fill";
