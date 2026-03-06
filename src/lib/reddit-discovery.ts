@@ -1,7 +1,8 @@
 import { prisma } from "./db";
 import { askGemini } from "./gemini";
 import { redis } from "./redis";
-import { chromium, BrowserContext } from "playwright";
+import { BrowserContext } from "playwright";
+import { launchStealthContext } from "./stealth-browser";
 import { addBrowserLog, fetchRedditProfileStats } from "./reddit-actions";
 import { decrypt } from "./encryption";
 import { getTempSessionPath, saveCookiesToDb, loadCookiesFromDb } from "./session-manager";
@@ -400,10 +401,10 @@ export async function discoverLeads(projectId: string, debugMode: boolean = fals
 
             console.log(`[DISCOVERY] Launching browser for @${username} (headless: ${!debugMode})`);
 
-            context = await chromium.launchPersistentContext(sessionPath, {
+            context = await launchStealthContext(sessionPath, {
                 headless: !debugMode,
                 slowMo: debugMode ? 50 : 0,
-                proxy: getPlaywrightProxy(),
+                proxy: getPlaywrightProxy() ?? undefined,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',

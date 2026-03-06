@@ -94,8 +94,9 @@ model RedditAccount {
   status      String   @default("active") // active, banned, warmup, cooldown
   karma       Int      @default(0)
   accountAge  Int?     // Days
-  browserCookies String? // JSON: stored cookies for session persistence across restarts
-  lastDebugScreenshot String? // Base64 or URL of the latest screenshot
+  browserCookies String? // JSON: stored cookies for session persistence
+  browserFingerprint String? // JSON: stored fingerprint (UA, viewport, etc.)
+  lastDebugScreenshot String? 
   lastDebugLogs   String? // JSON string array of the latest logs
   projectId   String
   createdAt   DateTime @default(now())

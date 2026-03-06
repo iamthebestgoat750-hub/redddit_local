@@ -1,4 +1,5 @@
-import { chromium, BrowserContext, Page, Cookie } from "playwright";
+import { BrowserContext, Page, Cookie } from "playwright";
+import { launchStealthContext } from "@/lib/stealth-browser";
 import { fetchRedditProfileStats } from "./reddit-actions";
 import { getTempSessionPath } from "./session-manager";
 import { prisma } from "@/lib/db";
@@ -94,10 +95,10 @@ export async function verifyRedditCredentials(username: string, password: string
         console.log(`[DEBUG] Starting verification for ${username} (Headless: ${headless})`);
         step = "launch";
 
-        context = await chromium.launchPersistentContext(sessionPath, {
+        context = await launchStealthContext(sessionPath, {
             headless: headless,
             slowMo: 0,
-            proxy: getPlaywrightProxy(),
+            proxy: getPlaywrightProxy() ?? undefined,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',

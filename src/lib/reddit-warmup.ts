@@ -1,4 +1,5 @@
-import { chromium, BrowserContext, Page } from "playwright";
+import { BrowserContext, Page } from "playwright";
+import { launchStealthContext, generateFingerprint, parseFingerprintFromDb } from "@/lib/stealth-browser";
 import { prisma } from "@/lib/db";
 import { decrypt } from "@/lib/encryption";
 import { askGemini } from "@/lib/gemini";
@@ -85,35 +86,34 @@ async function getWarmupDayNumber(accountId: string): Promise<number> {
 /**
  * Return randomised session targets based on which warmup day it is.
  *
- * Week 1
- *   Day 1-2 : only browse + 0-1 upvote (NO comments)
- *   Day 3-7 : 1-2 comments, 2-3 upvotes
- * Week 2 (Day 8-14)  : 2-3 comments, 3-4 upvotes
- * Week 3 (Day 15-21) : 4-5 comments, 4-5 upvotes
- * Week 4+ (Day 22+)  : 5-6 comments, 5-6 upvotes
+ * Safety-first schedule:
+ *   Day 1-7  : browse only + 0-1 upvote (NO comments — account too new)
+ *   Day 8-14 : 1-2 comments, 2-3 upvotes
+ *   Day 15-21: 3-4 comments, 3-4 upvotes
+ *   Day 22+  : 4-5 comments, 4-5 upvotes
  */
 function getSessionPlan(dayNumber: number): SessionPlan {
-    if (dayNumber <= 2) {
-        return {
-            upvoteGoal: randInt(0, 1),
-            commentGoal: 0,
-            browseMinutes: randInt(8, 13),
-            dayNumber,
-        };
-    }
     if (dayNumber <= 7) {
         return {
-            upvoteGoal: randInt(2, 3),
-            commentGoal: randInt(1, 2),
-            browseMinutes: randInt(6, 10),
+            upvoteGoal: randInt(0, 1),
+            commentGoal: 0, // No comments for first 7 days
+            browseMinutes: randInt(10, 20),
             dayNumber,
         };
     }
     if (dayNumber <= 14) {
         return {
+            upvoteGoal: randInt(2, 3),
+            commentGoal: randInt(1, 2),
+            browseMinutes: randInt(8, 15),
+            dayNumber,
+        };
+    }
+    if (dayNumber <= 21) {
+        return {
             upvoteGoal: randInt(3, 4),
-            commentGoal: randInt(2, 3),
-            browseMinutes: randInt(5, 9),
+            commentGoal: randInt(3, 4),
+            browseMinutes: randInt(6, 12),
             dayNumber,
         };
     }
@@ -580,23 +580,27 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
             }
         } catch { }
 
+        // ── Load or generate per-account fingerprint ───────────────
+        let fingerprint = parseFingerprintFromDb((account as any).browserFingerprint);
+        const isNewFingerprint = !(account as any).browserFingerprint;
+        if (isNewFingerprint) {
+            fingerprint = generateFingerprint();
+            await prisma.redditAccount.update({
+                where: { id: accountId },
+                data: { browserFingerprint: JSON.stringify(fingerprint) } as any,
+            });
+            await addLog(`🖥️ New fingerprint: ${fingerprint.userAgent.match(/Chrome\/([\d.]+)/)?.[1]} | ${fingerprint.viewport.width}x${fingerprint.viewport.height}`);
+        } else {
+            await addLog(`🖥️ Reusing stored fingerprint: Chrome/${fingerprint.chromeVersion} | ${fingerprint.viewport.width}x${fingerprint.viewport.height}`);
+        }
+
         // ── Launch browser ─────────────────────────────────────────
-        context = await chromium.launchPersistentContext(sessionPath, {
+        const sessionSlowMo = randInt(80, 150); // Randomize per session
+        context = await launchStealthContext(sessionPath, {
             headless: headless,
-            slowMo: 100,
-            proxy: getPlaywrightProxy(),
-            args: [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-extensions",
-            ],
-            userAgent:
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            viewport: { width: 1366, height: 768 },
+            slowMo: sessionSlowMo,
+            proxy: getPlaywrightProxy() ?? undefined,
+            fingerprint,
         });
 
         const page = context.pages()[0] || (await context.newPage());
@@ -621,28 +625,23 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
             Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
         });
 
-        // ── Session verification ────────────────────────────────────
+        // ── Session verification (DOM-based — no API calls) ────────
         async function verifySession(expectedUser: string): Promise<boolean> {
             try {
                 await page.waitForTimeout(2000);
-                const apiData = await page.evaluate(async () => {
-                    try {
-                        const res = await fetch("https://www.reddit.com/api/me.json", {
-                            credentials: "include",
-                        });
-                        if (res.ok) return (await res.json()).data;
-                    } catch { }
-                    return null;
-                });
-                if (apiData?.name) {
-                    const actualName = apiData.name.toLowerCase();
-                    const expected = expectedUser.toLowerCase();
-                    if (actualName === expected || expectedUser.includes("@")) {
-                        addLog(`✅ Session verified: Logged in as @${apiData.name}`);
-                        return true;
-                    }
-                    addLog(`⚠️ Session mismatch: @${apiData.name} vs expected @${expectedUser}`);
-                    return false;
+                // Check for the user menu or profile link — present only when logged in
+                const userLink = await page.$(
+                    `a[href*="/user/${expectedUser}"], a[href*="/user/${expectedUser.toLowerCase()}"], [aria-label*="Profile"], a[href*="/settings/profile"]`
+                );
+                if (userLink) {
+                    addLog(`✅ Session verified: @${expectedUser} is logged in (DOM check).`);
+                    return true;
+                }
+                // Fallback: check for user menu container
+                const menuEl = await page.$('shreddit-async-loader[bundlename="user_menu"], #nav-user-menu');
+                if (menuEl) {
+                    addLog(`✅ Session verified: user menu detected for @${expectedUser}.`);
+                    return true;
                 }
             } catch { }
             return false;
