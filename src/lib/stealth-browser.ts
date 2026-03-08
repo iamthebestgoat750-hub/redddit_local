@@ -6,7 +6,7 @@
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { chromium: stealthChromium } = require("playwright-extra");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const StealthPlugin = require("playwright-extra-plugin-stealth");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 import type { BrowserContext } from "playwright";
 
 // Apply stealth plugin once
@@ -83,18 +83,59 @@ export interface StealthLaunchOptions {
     proxy?: { server: string; username?: string; password?: string } | null;
     fingerprint?: BrowserFingerprint;
     args?: string[];
+    extensionPaths?: string[]; // Local paths to unpacked Chrome extensions
 }
 
 /**
  * Launch a stealth-patched persistent browser context with a given fingerprint.
  * Fingerprint should be loaded from DB (or generated once and saved).
+ *
+ * NOTE: Chrome extensions require headless:false to work.
  */
+/**
+ * Validate extension paths — ALL paths must have a manifest.json.
+ * Throws an error if any extension is broken so the bot stops immediately.
+ */
+function validateExtensionPaths(paths: string[]): string[] {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require("fs");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require("path");
+    for (const p of paths) {
+        const manifest = path.join(p, "manifest.json");
+        if (!fs.existsSync(manifest)) {
+            throw new Error(
+                `❌ Extension not found — manifest missing at:\n${manifest}\n\nFix CHROME_EXTENSIONS in .env and restart.`
+            );
+        }
+    }
+    return paths;
+}
+
 export async function launchStealthContext(
     sessionPath: string,
     options: StealthLaunchOptions = {}
 ): Promise<BrowserContext> {
-    const { proxy, fingerprint: fp, args: extraArgs, ...rest } = options;
+    const { proxy, fingerprint: fp, args: extraArgs, extensionPaths: rawPaths, ...rest } = options;
     const fingerprint = fp ?? generateFingerprint();
+
+    // Validate extension paths — skip any with missing manifest
+    const validPaths = rawPaths && rawPaths.length > 0 ? validateExtensionPaths(rawPaths) : [];
+
+    // Build extension args if we have valid paths
+    const extensionArgs: string[] = [];
+    if (validPaths.length > 0) {
+        const paths = validPaths.join(",");
+        extensionArgs.push(
+            `--load-extension=${paths}`,
+            `--disable-extensions-except=${paths}`,
+        );
+        if (rest.headless !== false) {
+            console.log("[STEALTH] Extensions loaded — browser opens minimized (do NOT close it).");
+            rest.headless = false;
+            extensionArgs.push("--start-minimized");
+        }
+    }
 
     return stealthChromium.launchPersistentContext(sessionPath, {
         headless: true,
@@ -110,7 +151,8 @@ export async function launchStealthContext(
             "--disable-dev-shm-usage",
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-extensions",
+            "--ignore-extension-errors",   // Don't crash on bad extension
+            ...extensionArgs,
             ...(extraArgs ?? []),
         ],
     }) as Promise<BrowserContext>;

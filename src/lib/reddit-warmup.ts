@@ -24,16 +24,16 @@ interface SessionPlan {
 const WARMUP_SUBREDDITS = [
     "r/NewToReddit",
     "r/NoStupidQuestions",
-    "r/Advice",
-    "r/AmazingStories",
+    "r/CasualConversation",
+    "r/AskReddit",
 ];
 
 // Subreddit tone guide for AI comments
 const SUBREDDIT_TONE_MAP: Record<string, string> = {
     "NewToReddit": "Be warm, welcoming, and encouraging. The person is new — make them feel at home. Keep it friendly and simple.",
     "NoStupidQuestions": "Be genuinely helpful, supportive, and direct. People here have real questions — give real, practical answers without being condescending.",
-    "Advice": "Be empathetic and practical. Offer a genuine perspective without being preachy. Be brief and human.",
-    "AmazingStories": "React with genuine amazement or curiosity. Share a brief thought on why the story is impressive or surprising.",
+    "CasualConversation": "Be friendly, open, and conversational. Share a related thought or ask a gentle open-ended question to keep the chat going naturally.",
+    "AskReddit": "Be thoughtful, concise, and relatable. Share a relevant personal-sounding anecdote or a helpful insight that fits the question.",
 };
 
 
@@ -86,57 +86,87 @@ async function getWarmupDayNumber(accountId: string): Promise<number> {
 /**
  * Return randomised session targets based on which warmup day it is.
  *
- * Safety-first schedule:
- *   Day 1-7  : browse only + 0-1 upvote (NO comments — account too new)
- *   Day 8-14 : 1-2 comments, 2-3 upvotes
+ * Schedule:
+ *   Day 1    : browse only + 0-1 upvote (NO comments — brand new account)
+ *   Day 2-7  : 1-2 comments, 1-2 upvotes
+ *   Day 8-14 : 2-3 comments, 2-3 upvotes
  *   Day 15-21: 3-4 comments, 3-4 upvotes
  *   Day 22+  : 4-5 comments, 4-5 upvotes
  */
 function getSessionPlan(dayNumber: number): SessionPlan {
+    // All days now have 20-40 mins of browsing as requested
+    const browseMinutes = randInt(20, 40);
+
+    if (dayNumber <= 1) {
+        return {
+            upvoteGoal: 0,
+            commentGoal: 0,
+            browseMinutes,
+            dayNumber,
+        };
+    }
     if (dayNumber <= 7) {
         return {
-            upvoteGoal: randInt(0, 1),
-            commentGoal: 0, // No comments for first 7 days
-            browseMinutes: randInt(10, 20),
+            upvoteGoal: randInt(2, 3),
+            commentGoal: randInt(1, 3),
+            browseMinutes,
             dayNumber,
         };
     }
     if (dayNumber <= 14) {
         return {
-            upvoteGoal: randInt(2, 3),
-            commentGoal: randInt(1, 2),
-            browseMinutes: randInt(8, 15),
+            upvoteGoal: randInt(3, 5),
+            commentGoal: randInt(2, 4),
+            browseMinutes,
             dayNumber,
         };
     }
     if (dayNumber <= 21) {
         return {
-            upvoteGoal: randInt(3, 4),
-            commentGoal: randInt(3, 4),
-            browseMinutes: randInt(6, 12),
+            upvoteGoal: randInt(5, 8),
+            commentGoal: randInt(3, 5),
+            browseMinutes,
             dayNumber,
         };
     }
-    if (dayNumber <= 21) {
-        return {
-            upvoteGoal: randInt(4, 5),
-            commentGoal: randInt(4, 5),
-            browseMinutes: randInt(5, 8),
-            dayNumber,
-        };
-    }
-    // Week 4+
+    // Week 4 (Day 22-30)
     return {
-        upvoteGoal: randInt(5, 6),
-        commentGoal: randInt(5, 6),
-        browseMinutes: randInt(4, 7),
+        upvoteGoal: randInt(8, 12),
+        commentGoal: randInt(5, 8),
+        browseMinutes,
         dayNumber,
     };
 }
 
 /**
- * Mini-browse: scroll the current page for a short random duration.
- * Simulates a human reading a page briefly.
+ * Check how many upvotes and comments were already logged TODAY for this account.
+ * Used so resuming a session doesn't repeat already-done actions.
+ */
+async function getTodaysProgress(accountId: string): Promise<{ upvotesDone: number; commentsDone: number }> {
+    try {
+        const now = new Date();
+        // Midnight local time
+        const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+        const logs = await prisma.warmupLog.findMany({
+            where: {
+                redditAccountId: accountId,
+                performedAt: { gte: midnight },
+            },
+            select: { action: true },
+        });
+        const upvotesDone = logs.filter(l => l.action === 'upvote').length;
+        const commentsDone = logs.filter(l => l.action === 'comment').length;
+        return { upvotesDone, commentsDone };
+    } catch {
+        return { upvotesDone: 0, commentsDone: 0 };
+    }
+}
+
+/**
+ * Mini-browse: scroll the current page for a REAL target duration.
+ * Uses a deadline loop so the actual elapsed time matches the target seconds,
+ * instead of a fixed scroll count that finishes too quickly.
+ * Simulates a human reading a page naturally.
  */
 async function miniBrowse(
     page: Page,
@@ -145,18 +175,24 @@ async function miniBrowse(
     maxSec = 60
 ): Promise<void> {
     const seconds = randInt(minSec, maxSec);
-    const scrollCount = Math.max(3, Math.floor(seconds / 8) + randInt(0, 3));
     addLog(`📖 Reading for ~${seconds}s...`);
 
-    for (let i = 0; i < scrollCount; i++) {
-        const scrollAmount = randInt(200, 600);
-        await page.mouse.wheel(0, scrollAmount);
-        await page.waitForTimeout(randInt(2000, 6000));
+    const deadline = Date.now() + seconds * 1000;
 
-        // Occasionally scroll back up a tiny bit (human behaviour)
+    while (Date.now() < deadline) {
+        const scrollAmount = randInt(150, 500);
+        await page.mouse.wheel(0, scrollAmount).catch(() => { });
+
+        // Occasionally pause longer — like a human reading something interesting
+        const pauseMs = Math.random() < 0.3
+            ? randInt(4000, 9000)   // Long pause: reading a post
+            : randInt(1500, 4000);  // Normal scroll pause
+        await page.waitForTimeout(pauseMs);
+
+        // Occasionally scroll back up a bit (human behaviour)
         if (Math.random() < 0.25) {
-            await page.mouse.wheel(0, -randInt(80, 200));
-            await page.waitForTimeout(randInt(600, 1500));
+            await page.mouse.wheel(0, -randInt(80, 200)).catch(() => { });
+            await page.waitForTimeout(randInt(500, 1500));
         }
     }
 }
@@ -169,16 +205,23 @@ async function extendedBrowse(
     page: Page,
     addLog: (msg: string) => void,
     checkStop: () => Promise<void>,
-    subreddits: string[]
+    subreddits: string[],
+    browseMins: number = 15
 ): Promise<{ candidateUrls: string[]; visitedSubs: string[] }> {
     const candidateUrls: string[] = [];
     const visitedSubs: string[] = [];
 
-    // ── 1. Home feed — fully random duration (5 to 9 minutes) ─────
-    const homeFeedMin = randInt(300, 420); // 5 to 7 min
-    const homeFeedMax = randInt(440, 540); // 7.3 to 9 min
-    addLog("🏠 Browsing home feed...");
-    // Proxy can be slow — try with 60s timeout, retry once on failure
+    // Scale reading times based on total browse budget
+    const totalSecs = browseMins * 60;
+    // Home feed gets 25% of budget, subreddits share the rest
+    const homeSecs = Math.floor(totalSecs * 0.25);
+    const homeFeedMin = Math.floor(homeSecs * 0.8);
+    const homeFeedMax = homeSecs;
+    // Number of subs scales with time: ~1 sub per 3 min
+    const maxSubs = Math.max(1, Math.floor(browseMins / 3));
+    const secsPerSub = Math.floor((totalSecs * 0.6) / maxSubs);
+
+    addLog(`🏠 Browsing home feed...`);
     try {
         await page.goto("https://www.reddit.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
     } catch {
@@ -193,9 +236,10 @@ async function extendedBrowse(
     await miniBrowse(page, addLog, homeFeedMin, homeFeedMax);
     await checkStop();
 
-    // ── 2. Visit all subreddits (shuffled for randomness) ──────────
+    // ── 2. Visit subreddits (limited by time budget) ───────────────
     const shuffledSubs = [...subreddits].sort(() => Math.random() - 0.5);
-    const subsToVisit = shuffledSubs; // always visit all available subs
+    const subsToVisit = shuffledSubs.slice(0, maxSubs);
+    addLog(`📋 Visiting ${subsToVisit.length} subreddit(s) in ${browseMins}min budget...`);
 
     for (const sub of subsToVisit) {
         await checkStop();
@@ -206,21 +250,25 @@ async function extendedBrowse(
                 timeout: 30000,
             });
             await page.waitForTimeout(randInt(1500, 4000));
-            // Per-subreddit read time — main communities get more time
-            const isPrimary = sub.includes('NewToReddit') || sub.includes('NoStupidQuestions');
-            const subMin = isPrimary ? randInt(240, 360) : randInt(180, 240); // 4-6 min vs 3-4 min
-            const subMax = isPrimary ? randInt(370, 480) : randInt(250, 300); // up to 8 min vs 5 min
+            const subMin = Math.floor(secsPerSub * 0.8);
+            const subMax = secsPerSub;
             await miniBrowse(page, addLog, subMin, subMax);
 
-            // Collect post URLs from this subreddit
+            visitedSubs.push(sub);
+
+            // Collect post URLs from this subreddit for potential actions later
             await page.waitForSelector("shreddit-post", { timeout: 10000 }).catch(() => { });
             const postEls = page.locator("shreddit-post");
             const cnt = await postEls.count();
-            for (let i = 0; i < Math.min(cnt, 8); i++) {
+            const subredditCandidates: string[] = [];
+            for (let i = 0; i < Math.min(cnt, 5); i++) {
                 const href = await postEls.nth(i).getAttribute("permalink");
-                if (href) candidateUrls.push(`https://www.reddit.com${href}`);
+                if (href) {
+                    const fullUrl = `https://www.reddit.com${href}`;
+                    subredditCandidates.push(fullUrl);
+                    candidateUrls.push(fullUrl);
+                }
             }
-            visitedSubs.push(sub);
 
             // ── RULES SCRAPING: First visit or stale rules ───────────
             const subName = sub.replace('r/', '');
@@ -511,18 +559,26 @@ async function executeMixedSession(
 
 export async function warmupAccount(accountId: string, headless: boolean = true): Promise<WarmupResult> {
     const logs: string[] = [];
+    // ── Debounced log writer: prevents concurrent SQLite write/read collisions ──
+    let _logWritePending = false;
     const addLog = async (msg: string) => {
         const timestamp = new Date().toLocaleTimeString();
         const fullMsg = `${timestamp}: ${msg}`;
         console.log(`[WARMUP][${timestamp}] ${msg}`);
         logs.push(fullMsg);
 
+        // Skip if a write is already in flight (avoid concurrent SQLite writes)
+        if (_logWritePending) return;
+        _logWritePending = true;
         try {
+            const safeJson = JSON.stringify(logs.slice(-50));
             await (prisma as any).redditAccount.update({
                 where: { id: accountId },
-                data: { lastDebugLogs: JSON.stringify(logs.slice(-50)) },
+                data: { lastDebugLogs: safeJson },
             });
-        } catch (e) { }
+        } catch (e) { } finally {
+            _logWritePending = false;
+        }
     };
 
     const captureScreenshot = async (page: Page) => {
@@ -566,8 +622,19 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
         // ── Determine warmup day before launching browser ──────────
         const dayNumber = await getWarmupDayNumber(accountId);
         const plan = getSessionPlan(dayNumber);
+
+        // ── Subtract already-done actions from today (resume-safe) ─────
+        const todaysDone = await getTodaysProgress(accountId);
+        const remainingUpvotes = Math.max(0, plan.upvoteGoal - todaysDone.upvotesDone);
+        const remainingComments = Math.max(0, plan.commentGoal - todaysDone.commentsDone);
+        plan.upvoteGoal = remainingUpvotes;
+        plan.commentGoal = remainingComments;
+
         await addLog(
-            `📅 Warmup Day ${dayNumber} — Plan: ${plan.upvoteGoal} upvotes | ${plan.commentGoal} comments | ~20-40 min browse (6-9 subreddits)`
+            `📅 Warmup Day ${dayNumber} — Plan: ${remainingUpvotes} upvotes | ${remainingComments} comments | ~${plan.browseMinutes} min browse` +
+            (todaysDone.upvotesDone > 0 || todaysDone.commentsDone > 0
+                ? ` (Today already done: ${todaysDone.upvotesDone} upvotes, ${todaysDone.commentsDone} comments)`
+                : '')
         );
 
         // ── Show active IP before browser launch ───────────────────
@@ -596,11 +663,18 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
 
         // ── Launch browser ─────────────────────────────────────────
         const sessionSlowMo = randInt(80, 150); // Randomize per session
+        const extensionPaths = process.env.CHROME_EXTENSIONS
+            ? process.env.CHROME_EXTENSIONS.split(",").map(p => p.trim()).filter(Boolean)
+            : [];
+        if (extensionPaths.length > 0) {
+            await addLog(`🧩 Loading ${extensionPaths.length} extension(s) in browser.`);
+        }
         context = await launchStealthContext(sessionPath, {
             headless: headless,
             slowMo: sessionSlowMo,
             proxy: getPlaywrightProxy() ?? undefined,
             fingerprint,
+            extensionPaths,
         });
 
         const page = context.pages()[0] || (await context.newPage());
@@ -664,8 +738,13 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
             }).then(() => false),
         ]).catch(() => false);
 
+        // If user menu is visible → we're logged in (trust the DOM detection)
+        // verifySession with email username was causing false failures
         let isLoggedIn = false;
-        if (isDetected) isLoggedIn = await verifySession(account.username);
+        if (isDetected) {
+            addLog(`✅ User menu detected — session active.`);
+            isLoggedIn = true;
+        }
 
         if (!isLoggedIn) {
             await addLog("No valid session. Logging in...");
@@ -731,47 +810,191 @@ export async function warmupAccount(accountId: string, headless: boolean = true)
 
         await checkStop();
 
-        // ── Extended browsing ───────────────────────────────────────
-        await addLog("🌐 Starting extended browsing session...");
-        await prisma.warmupLog.create({
-            data: { redditAccountId: accountId, action: "browse", targetSubreddit: "home" },
-        });
+        // ── Extended Mixed Session ──────────────────────────────────
+        await addLog("🌐 Starting extended mixed browsing & engagement session...");
 
-        const { candidateUrls, visitedSubs } = await extendedBrowse(
-            page,
-            addLog,
-            checkStop,
-            WARMUP_SUBREDDITS
-        );
+        // Home browse first (~15% of budget)
+        const homeSecs = Math.floor(plan.browseMinutes * 60 * 0.15);
+        addLog(`🏠 Browsing home feed for ~${homeSecs}s...`);
+        try {
+            await page.goto("https://www.reddit.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+            await page.waitForTimeout(randInt(2000, 5000));
+            await miniBrowse(page, addLog, Math.floor(homeSecs * 0.8), homeSecs);
+        } catch {
+            addLog("⚠️ Home feed load slow, skipping to subreddits.");
+        }
 
-        await checkStop();
+        // Subreddit browsing + interleaved actions
+        const shuffledSubs = [...WARMUP_SUBREDDITS].sort(() => Math.random() - 0.5);
+        const maxSubs = Math.max(2, Math.floor(plan.browseMinutes / 4));
+        let subsToVisit = shuffledSubs.slice(0, maxSubs);
 
-        await checkStop();
+        // If comment goal > available subreddits, repeat the list so the bot
+        // has enough visits to complete all planned comments.
+        // (Each repeated visit still uses a DIFFERENT post due to commentedPostIds tracking)
+        if (plan.commentGoal > subsToVisit.length) {
+            const extra = plan.commentGoal - subsToVisit.length;
+            const extraSubs = [...WARMUP_SUBREDDITS]
+                .sort(() => Math.random() - 0.5)
+                .slice(0, extra);
+            subsToVisit = [...subsToVisit, ...extraSubs];
+            addLog(`📋 Extended sub visits to ${subsToVisit.length} (goal: ${plan.commentGoal} comments).`);
+        }
 
-        // ── Mixed engagement session ────────────────────────────────
+        const secsPerSub = Math.floor((plan.browseMinutes * 60 * 0.7) / subsToVisit.length);
 
-        // Only do engagement if there's anything to do
-        if (plan.upvoteGoal > 0 || plan.commentGoal > 0) {
-            // Skip comments for very new accounts (< 1 day)
-            const accountAgeDays = account.accountAge || 0;
-            if (accountAgeDays < 1 && plan.commentGoal > 0) {
-                await addLog(
-                    `⚠️ Account only ${accountAgeDays} day(s) old. Skipping comments — browse + upvote only.`
-                );
-                plan.commentGoal = 0;
+
+        let upvotesDone = 0;
+        let commentsDone = 0;
+
+        // ── Load already-commented post IDs (from today's logs) so we never
+        //    comment on the same post twice, even across resumed sessions. ─────
+        const commentedPostIds = new Set<string>();
+        try {
+            const now = new Date();
+            const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+            const pastComments = await prisma.warmupLog.findMany({
+                where: {
+                    redditAccountId: accountId,
+                    action: 'comment',
+                    performedAt: { gte: midnight },
+                },
+                select: { targetPostId: true },
+            });
+            pastComments.forEach(c => { if (c.targetPostId) commentedPostIds.add(c.targetPostId); });
+            if (commentedPostIds.size > 0) {
+                addLog(`📋 Skipping ${commentedPostIds.size} already-commented post(s) from earlier today.`);
             }
+        } catch { }
 
-            await executeMixedSession(
-                page,
-                plan,
-                candidateUrls,
-                visitedSubs.length > 0 ? visitedSubs : ["r/AskReddit"],
-                accountId,
-                addLog,
-                checkStop
-            );
-        } else {
-            await addLog("📅 Day 1-2 plan: browse-only session. No engagement today.");
+        for (const sub of subsToVisit) {
+            await checkStop();
+            addLog(`📌 Visiting ${sub}...`);
+            try {
+                await page.goto(`https://www.reddit.com/${sub}/`, { waitUntil: "domcontentloaded", timeout: 45000 });
+                await page.waitForTimeout(randInt(3000, 6000));
+
+                // ── JOIN FIRST ──────────────────────────────────────
+                const subName = sub.replace('r/', '');
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const subRecord = await (prisma.subreddit as any).findUnique({ where: { name: subName } });
+
+                if (!subRecord?.isJoined) {
+                    addLog(`➕ Checking join status for ${sub}...`);
+                    await page.waitForTimeout(randInt(4000, 8000));
+                    const joined = await ensureJoinedCommunity(page, sub);
+                    if (joined) {
+                        addLog(`✅ Successfully joined ${sub}!`);
+                        await (prisma.subreddit as any).upsert({
+                            where: { name: subName },
+                            update: { isJoined: true },
+                            create: { name: subName, isJoined: true }
+                        }).catch(() => { });
+
+                        // ── Dismiss Reddit's "Welcome" popup after joining ──────
+                        // Reddit shows a modal with a "Got It" button which blocks
+                        // any further interaction until dismissed.
+                        try {
+                            const gotItBtn = await page.waitForSelector(
+                                'button:has-text("Got It"), button:has-text("Got it"), faceplate-button:has-text("Got It"), [data-testid="welcome-modal-dismiss"]',
+                                { timeout: 5000 }
+                            );
+                            if (gotItBtn) {
+                                addLog(`🔔 Dismissing welcome popup for ${sub}...`);
+                                await gotItBtn.click();
+                                await page.waitForTimeout(randInt(1000, 2000));
+                                addLog(`✅ Welcome popup dismissed.`);
+                            }
+                        } catch {
+                            // No popup appeared — that's fine, continue
+                        }
+                    }
+                } else {
+                    addLog(`✅ Already joined ${sub} — proceeding to browse.`);
+                }
+
+                await checkStop();
+
+                // ── BROWSE AFTER JOIN ───────────────────────────────
+                addLog(`📖 Reading ${sub} for ~${secsPerSub}s...`);
+                // Use exact secsPerSub (no random range reduction) so total
+                // session time actually matches the planned browseMinutes.
+                await miniBrowse(page, addLog, secsPerSub, secsPerSub);
+
+                // Grab some posts
+                const postEls = page.locator("shreddit-post");
+                const cnt = await postEls.count();
+                const posts: string[] = [];
+                for (let i = 0; i < Math.min(cnt, 5); i++) {
+                    const href = await postEls.nth(i).getAttribute("permalink");
+                    if (href) posts.push(`https://www.reddit.com${href}`);
+                }
+
+                // Decide if we do an action in this sub
+                // We interleave actions: maybe an upvote, maybe a comment
+                if (posts.length > 0) {
+                    // Try to do one action per sub visit if goals aren't met
+                    const doUpvote = upvotesDone < plan.upvoteGoal && Math.random() < 0.8;
+
+                    // Smart comment guarantee: count how many subs are left
+                    // (including this one) vs how many comments still needed.
+                    // If remaining_subs <= remaining_comments, ALWAYS comment
+                    // so we never finish a session short on the goal.
+                    const subsRemaining = subsToVisit.length - subsToVisit.indexOf(sub);
+                    const commentsNeeded = plan.commentGoal - commentsDone;
+                    const mustComment = commentsNeeded > 0 && subsRemaining <= commentsNeeded;
+                    const doComment = commentsNeeded > 0 && (mustComment || Math.random() < 0.8);
+
+                    if (doUpvote) {
+                        const url = posts[Math.floor(Math.random() * posts.length)];
+                        addLog(`🔗 Interleaved action: upvoting a post in ${sub}...`);
+                        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+                        await miniBrowse(page, addLog, 15, 30);
+                        const success = await upvotePost(page);
+                        if (success) {
+                            upvotesDone++;
+                            addLog(`⬆️ Upvoted post in ${sub}.`);
+                            await prisma.warmupLog.create({
+                                data: { redditAccountId: accountId, action: "upvote", targetSubreddit: sub, targetPostId: url.split("/").slice(-2)[0] }
+                            });
+                        }
+                        await page.waitForTimeout(randInt(5000, 15000));
+                    }
+
+                    if (doComment && commentsDone < plan.commentGoal) {
+                        // Pick a post that hasn't been commented on before
+                        const availablePosts = posts.filter(p => {
+                            const postId = p.split("/").slice(-2)[0];
+                            return !commentedPostIds.has(postId);
+                        });
+
+                        if (availablePosts.length === 0) {
+                            addLog(`⚠️ All posts in ${sub} already commented — skipping.`);
+                        } else {
+                            const url = availablePosts[Math.floor(Math.random() * availablePosts.length)];
+                            const postId = url.split("/").slice(-2)[0];
+                            addLog(`💬 Interleaved action: commenting in ${sub}...`);
+                            await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+                            await miniBrowse(page, addLog, 20, 45);
+                            const subredditName = sub.replace("r/", "");
+                            const commentTxt = await generateComment(page, url, subredditName, addLog);
+                            const success = await joinAndComment(page, url, commentTxt);
+                            if (success) {
+                                commentsDone++;
+                                commentedPostIds.add(postId); // mark as done in this session too
+                                addLog(`✅ Commented in ${sub}.`);
+                                await prisma.warmupLog.create({
+                                    data: { redditAccountId: accountId, action: "comment", targetSubreddit: sub, targetPostId: postId }
+                                });
+                            }
+                            await page.waitForTimeout(randInt(5000, 15000));
+                        }
+                    }
+                }
+
+            } catch (err: any) {
+                addLog(`⚠️ Error visiting ${sub}: ${err.message}`);
+            }
         }
 
         // ── Final stats refresh ─────────────────────────────────────

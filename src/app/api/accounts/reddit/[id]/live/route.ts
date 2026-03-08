@@ -33,7 +33,7 @@ export async function GET(
 
         return NextResponse.json({
             screenshot: account.lastDebugScreenshot ?? null,
-            logs: account.lastDebugLogs ? JSON.parse(account.lastDebugLogs) : [],
+            logs: (() => { try { return account.lastDebugLogs ? JSON.parse(account.lastDebugLogs) : []; } catch { return []; } })(),
         });
     } catch (error) {
         return NextResponse.json({ error: "Failed to fetch live data" }, { status: 500 });

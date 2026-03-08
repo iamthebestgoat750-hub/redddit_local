@@ -52,7 +52,13 @@ export async function loadCookiesFromDb(accountId: string, context: BrowserConte
             return false;
         }
 
-        const cookies = JSON.parse(account.browserCookies);
+        let cookies;
+        try {
+            cookies = JSON.parse(account.browserCookies);
+        } catch (parseErr) {
+            console.warn(`[SESSION] Cookie JSON is corrupt for account ${accountId} — skipping restore.`);
+            return false;
+        }
         await context.addCookies(cookies);
 
         console.log(`[SESSION] ✅ Loaded ${cookies.length} cookies from DB for account ${accountId}`);
